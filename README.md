@@ -132,6 +132,8 @@ host/desklink/     Python host
   video.py         per-monitor GStreamer pipelines, encoder fallback
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
+  displays.py      kscreen-doctor polling for live monitor changes
+  viewer/          GTK4 desktop viewer (net, decode, app)
   testclient.py    reference client (dumps H.264, sends scripted input)
 android/app/       Kotlin/Compose client
 protocol.md        wire protocol spec (source of truth for both sides)
