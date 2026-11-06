@@ -25,9 +25,9 @@ session is created.
 - **30 fps H.264 streaming** with hardware encode (NVENC) and automatic
   x264 fallback; per-frame backpressure with forced keyframes on drops
 - **Per-client quality** — every client picks its own bitrate and resolution
-  cap (`set-quality`); clients with identical settings share one encode,
-  others get their own pipeline. A phone at 2 Mbps doesn't disturb a viewer
-  at native 4K
+  cap (`set-quality`); the host keeps **one capture per monitor** and builds
+  one encode branch per distinct (resolution-cap, bitrate) pair off it, so a
+  phone at 2 Mbps doesn't disturb a viewer at native 4K
 - **Resolution auto-fit** (desktop viewer) — the stream is downscaled to the
   window's device size, so a 1080p laptop can watch a 4K host cheaply
 - **Live display changes** — monitor resolution changes are detected and
@@ -118,9 +118,11 @@ Unicode keysym path, so the client and host keyboard layouts can differ.
 ## Quality and resolution handling
 
 - Quality is **per client**: pick Low/High in the menu, or let the viewer
-  auto-fit. The host keeps one encode pipeline per distinct
-  (stream, resolution-cap, bitrate) triple; clients with the same settings
-  share one encode
+  auto-fit. The host keeps **one capture per monitor** (KWin's screencast
+  streams are single-consumer) and builds one encode branch per distinct
+  (resolution-cap, bitrate) pair off it via a `tee`; clients with the same
+  settings share a branch, a quality change rebuilds the capture (brief
+  keyframe gap)
 - Under congestion the host drops the oldest frames and forces a keyframe
 - Monitor resolution changes are picked up live (the stream rebuilds and
   clients receive the new encoded size); a monitor unplug restarts the
@@ -170,6 +172,7 @@ host/desklink/     Python host
   displays.py      kscreen-doctor polling for live monitor changes
   viewer/          GTK4 desktop viewer (net, decode, app)
   testclient.py    reference client (dumps H.264, sends scripted input)
+  e2e_multiclient.py  multi-client quality test (needs a running host + PIN)
 android/app/       Kotlin/Compose client (MediaCodec decode, Compose UI)
 protocol.md        wire protocol spec (source of truth for both sides)
 host/contrib/      systemd user service + autostart desktop file (optional)

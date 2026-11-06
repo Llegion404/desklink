@@ -147,6 +147,10 @@ class DeskLinkServer:
         self.node_to_idx: dict[int, int] = {}
         self.idx_to_node: dict[int, int] = {}
         self._idr_last: dict[tuple, float] = {}
+        # last known encoded size per pipeline key — a client joining an
+        # already-running encode must be told the size (the pipeline itself
+        # only reports on CHANGE)
+        self._encoded: dict[tuple, tuple] = {}
         self._server: asyncio.AbstractServer | None = None
         self._stopping = asyncio.Event()
         self._restarting = False
@@ -190,7 +194,10 @@ class DeskLinkServer:
         self.idx_to_node = {i: s.node_id for i, s in enumerate(session.streams)}
         self.video.on_frame = lambda sid, kf, pts, data: \
             aloop.call_soon_threadsafe(self._distribute, sid, kf, pts, data)
-        self.video.on_stream_error = self._on_stream_error
+        # fires from the GLib thread (pipeline start failure / encoder retry)
+        # — must be marshaled like every other cross-thread callback
+        self.video.on_stream_error = lambda key, msg: \
+            aloop.call_soon_threadsafe(self._on_stream_error, key, msg)
         self.video.on_encoded_size = lambda sid, w, h: \
             aloop.call_soon_threadsafe(self._on_encoded_size, sid, w, h)
         self.video.on_capture_lost = lambda sid, msg: \
@@ -332,6 +339,7 @@ class DeskLinkServer:
     def _on_encoded_size(self, key: tuple, w: int, h: int):
         """Actual encoded resolution (after any max_h downscale) — pushed to
         the clients on this pipeline so they can letterbox + label correctly."""
+        self._encoded[key] = (w, h)
         idx = self.node_to_idx.get(key[0], key[0])
         log.info("stream %d encoded size %dx%d (key %r)", idx, w, h,
                  (key[1], key[2]))
@@ -483,6 +491,12 @@ class DeskLinkServer:
                          client.quality[0])
             await client.sender.send_json(
                 {"type": "subscribed", "stream": self.node_to_idx[node]})
+            # joining an already-running encode: push the cached encoded size
+            dims = self._encoded.get(client.pkey)
+            if dims:
+                await client.sender.send_json(
+                    {"type": "stream-info", "stream": self.node_to_idx[node],
+                     "w": dims[0], "h": dims[1]})
         elif mtype == "set-quality":
             # per-client: this client's pipeline is (re)built with its own
             # settings; other clients keep theirs — no more global cap
@@ -492,6 +506,13 @@ class DeskLinkServer:
                     and client.pkey is not None):
                 client.pkey = self.video.move_quality(
                     client.stream, client.pkey, kbps, maxh)
+                # moving onto an already-running encode: push its cached size
+                dims = self._encoded.get(client.pkey)
+                if dims:
+                    await client.sender.send_json(
+                        {"type": "stream-info",
+                         "stream": self.node_to_idx[client.stream],
+                         "w": dims[0], "h": dims[1]})
             client.quality = (kbps, maxh)
             log.info("client #%d quality -> %d kbps, max height %s",
                      client.id, kbps, maxh or "native")
