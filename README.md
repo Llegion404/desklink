@@ -1,155 +1,189 @@
 # DeskLink
 
-AnyDesk-style remote desktop for **KDE Plasma on Wayland** (host) and
-**Android** (client). Screen capture and input injection go through the
-official XDG desktop portal (PipeWire + libei) — no root, no X11 hacks.
+Self-hosted remote desktop for KDE Plasma (Wayland): control your Linux
+desktop from an **Android phone** or another **Linux machine** — over LAN or
+Tailscale, with no cloud, no accounts and no relay servers. One small Python
+host, two clients, one documented wire protocol.
 
 ```
-┌─ Android client ───────────┐          ┌─ Linux host (KDE Plasma 6 / Wayland) ─┐
-│ Kotlin + Compose           │          │ Python 3 + PyGObject + GStreamer      │
-│ MediaCodec H.264 hw decode │◄─TCP:9090─┤ pipewiresrc → NVENC/x264 (zerolatency)│
-│ touch → pointer/keyboard   │─control──►│ RemoteDesktop portal: absolute pointer,│
-│ clipboard + file manager   │◄─2-way──► │ keysyms, Clipboard portal, file sandbox│
-└────────────────────────────┘          └───────────────────────────────────────┘
+Android / Linux client                        Linux (KDE Wayland) host
+┌──────────────────────────┐    TCP 9090   ┌───────────────────────────────┐
+│ MediaCodec / GStreamer   │◄── H.264 ─────│ pipewiresrc → NVENC/x264 →    │
+│ low-latency H.264 decode │── input ─────►│ appsink   (per-client encode) │
+│ touch / mouse / keyboard │◄── clip ──────│ XDG RemoteDesktop portal      │
+│ clipboard · file xfer    │── JSON/IPC ──►│ (ScreenCast + input inject)   │
+└──────────────────────────┘               └───────────────────────────────┘
 ```
+
+The host uses the XDG **RemoteDesktop + ScreenCast portals** — no root, no
+keyloggers, no virtual displays. Capture, encoding and input injection all
+run inside your user session; the desktop shows a consent dialog when a
+session is created.
 
 ## Features
-- Live H.264 screen streaming (hardware NVENC when available, x264 fallback),
-  30 fps, ~150 ms LAN latency
-- Full remote control: absolute pointer, clicks, drag, scroll, keyboard text
-  (any language via IME), special keys + sticky Ctrl/Alt/Shift/Super
-- **Hardware-keyboard passthrough** — plug a keyboard into the phone/tablet;
-  letters, digits and Ctrl/Alt/Super combos go straight to the host
-- **Auto-reconnect** — network blips recover in 1.5–12 s with backoff, same
-  stream and monitor
-- **Saved hosts** — one-tap reconnect to known machines (add/remove in the
-  connect screen)
-- **View-only mode** — watch without sending any input
-- **Live quality switching** — Very low (1 Mbps · 720p) / Low (2 Mbps ·
-  1080p) / Balanced / High from the session menu, applied to the running
-  encoder instantly; the client letterboxes to the real encoded resolution
-- **Aspect-correct display** — video is letterboxed (never stretched) and
-  touch coordinates match what you see; pinch to zoom, two fingers to
-  scroll, double-finger spread switches to zoom mode automatically
-- **Resolution-change resilience** — changing the monitor resolution or
-  unplugging a monitor mid-session rebuilds the stream and keeps clients
-  connected (a new consent dialog may appear; approve it to resume)
-- **Immersive mode** — fullscreen with hidden system bars (swipe from the
-  edge to reveal; toggle in the session menu)
-- Multi-monitor: pick which screen to control; monitor switching on the fly
-- Two-way clipboard sync (text) via the Clipboard portal
-- File transfer: browse your home dir, download to the phone's Downloads
-  (streamed to disk — no memory cap), upload to `~/Downloads/desklink`;
-  live progress in the files sheet
-- Desktop notifications when a client connects and when the last one leaves
-- PIN authentication (challenge–response HMAC; the PIN itself is never sent)
-- Transport: direct TCP. Works on LAN and over Tailscale with zero extra setup.
 
-## Host setup (this machine)
+- **30 fps H.264 streaming** with hardware encode (NVENC) and automatic
+  x264 fallback; per-frame backpressure with forced keyframes on drops
+- **Per-client quality** — every client picks its own bitrate and resolution
+  cap (`set-quality`); clients with identical settings share one encode,
+  others get their own pipeline. A phone at 2 Mbps doesn't disturb a viewer
+  at native 4K
+- **Resolution auto-fit** (desktop viewer) — the stream is downscaled to the
+  window's device size, so a 1080p laptop can watch a 4K host cheaply
+- **Live display changes** — monitor resolution changes are detected and
+  handled; an unplug triggers an automatic portal re-request and clients
+  resume after approving the new consent dialog
+- **Direct input** — absolute pointer, click/drag, wheel, full keyboard
+  (Unicode keysym path: client and host keyboard layouts can differ)
+- **Android**: pinch-zoom that actually zooms, two-finger scroll, keyboard
+  sheet with sticky modifiers, hardware-key passthrough, multi-monitor
+  picker, two-way clipboard, streamed file transfer (no memory cap),
+  auto-reconnect, saved hosts
+- **Desktop viewer (GTK4)**: aspect-correct letterboxed display, monitor
+  picker, quality presets, view-only, fullscreen, two-way clipboard,
+  auto-reconnect
+- **Security**: per-connection HMAC-SHA256 challenge over a random salt —
+  the PIN never crosses the wire
+- Works over **plain LAN and Tailscale** with zero extra infrastructure
 
-Requirements (already present on this install): Python 3 + PyGObject,
-GStreamer 1.x with `gst-plugins-good` (pipewiresrc), `gst-plugins-bad`
-(NVENC) or `gst-plugins-ugly` (x264), PipeWire, xdg-desktop-portal-kde ≥ 6.
+## Requirements
 
-```bash
-cd ~/personal/desklink/host
-python3 -m desklink set-pin          # choose a PIN (≥4 chars)
-python3 -m desklink serve            # a KDE consent dialog appears — click Share
-```
+**Host** (the machine being controlled):
+- KDE Plasma 6 on Wayland with `xdg-desktop-portal-kde`
+- Python 3.10+ with PyGObject (`python-gobject`)
+- GStreamer 1.x: `gst-plugins-good` (pipewiresrc), `gst-plugins-bad`
+  (NVENC, optional), `gst-plugins-ugly` (x264)
+- PipeWire
 
-> The XDG portal does not allow "remember" for remote-desktop sessions, so
-> the consent dialog appears every time the host starts. If you run the host
-> as a systemd service, that is one click per boot.
-
-Other commands:
+Arch/CachyOS:
 
 ```bash
-python3 -m desklink status                 # show LAN + Tailscale addresses
-python3 -m desklink.testclient --help      # test client (dump stream to .h264)
+sudo pacman -S --needed python python-gobject gst-plugins-good gst-plugins-bad gst-plugins-ugly pipewire
 ```
 
-Configuration lives at `~/.config/desklink/config.toml` (port, bitrate,
-framerate, encoder, downloads dir, allowed file roots).
+**Android client**: Android 8.0+ (minSdk 26); build with JDK 17 + Android
+SDK 35.
+
+**Desktop viewer**: GTK4 + GStreamer introspection (`gtk4`, `gst-python`).
+
+## Quick start — host
+
+```bash
+git clone https://github.com/Llegion404/desklink.git
+cd desklink/host
+python3 -m desklink set-pin            # choose a PIN (≥4 chars)
+python3 -m desklink serve              # a consent dialog appears — approve it
+python3 -m desklink status             # prints LAN/Tailscale addresses
+```
+
+Optional: auto-start at login with the bundled systemd user unit
+(see `host/contrib/desklink.service`; edit `WorkingDirectory` to your
+checkout).
 
 ## Android client
 
 ```bash
-cd ~/personal/desklink/android
-./gradlew installDebug        # device connected via adb
-# or: ./gradlew assembleDebug → app/build/outputs/apk/debug/app-debug.apk
+cd desklink/android
+./gradlew assembleDebug     # → app/build/outputs/apk/debug/app-debug.apk
+./gradlew installDebug      # device attached via adb
 ```
 
-In the app: enter `host:port` + PIN → Connect.
+Open the app, enter `host:port` + PIN, connect. You can also launch
+pre-connected:
 
-- Tap = left click · double-tap = double click · long-press = right click
-- 1-finger drag = click-drag · 2-finger drag = scroll + pan · pinch = zoom
-- Keyboard icon = text input + special keys and sticky modifiers
-- Folder icon = file manager (download/upload)
-- On the Android emulator, connect to `10.0.2.2:9090` (host loopback).
+```bash
+adb shell am start -n com.desklink.client/.MainActivity \
+  --es host "192.168.1.20:9090" --es pin "1234"
+```
+
+Controls: tap = left click · long-press = right click · drag = move-drag ·
+two-finger drag = scroll · pinch = zoom · keyboard icon = text, special keys
+and sticky Ctrl/Alt/Shift/Super · folder icon = file transfer · ☰ menu =
+monitor picker, quality, view-only.
 
 ## Desktop viewer (desktop → desktop)
 
-Control one desktop from another Linux machine — or the same one. GTK4 +
-GStreamer, ships with the host package:
-
 ```bash
-python3 -m desklink view --host 192.168.5.70 --pin 1234
-# --port, --fullscreen, --view-only, --no-auto-fit also available
+cd desklink/host
+python3 -m desklink view --host 192.168.1.20 --pin 1234
+# --port --fullscreen --view-only --no-auto-fit
 ```
 
-- **Resolution auto-fit** — the viewer asks the host to downscale the stream
-  to its window size (device pixels), so a 1080p laptop viewing a 4K host
-  decodes ~2 Mpixel frames instead of 8. Disable with `--no-auto-fit` or the
-  menu toggle; manual quality presets set the bitrate either way.
-- Letterboxed rendering at any window shape; pointer, wheel and keyboard are
-  injected (printable keys via the host's Unicode keysym path, so client and
-  host layouts can differ).
-- Monitor picker, View-only, Fullscreen (F11), live stats, two-way clipboard.
-- Auto-reconnect with backoff; survives host session auto-restarts via the
-  re-`hello` (clients re-subscribe automatically).
+The viewer letterboxes the stream to any window shape and, by default
+(**auto-fit**), asks the host to downscale to the window's device size —
+a 1080p laptop watching a 4K host decodes ~2 Mpixel frames instead of 8.
+Pointer, wheel and keyboard are injected; printable keys go through a
+Unicode keysym path, so the client and host keyboard layouts can differ.
+
+## Quality and resolution handling
+
+- Quality is **per client**: pick Low/High in the menu, or let the viewer
+  auto-fit. The host keeps one encode pipeline per distinct
+  (stream, resolution-cap, bitrate) triple; clients with the same settings
+  share one encode
+- Under congestion the host drops the oldest frames and forces a keyframe
+- Monitor resolution changes are picked up live (the stream rebuilds and
+  clients receive the new encoded size); a monitor unplug restarts the
+  portal session and every connected client resumes after you approve the
+  dialog
+- One NVENC session is used per process (concurrent NVENC sessions crash
+  some drivers); additional simultaneous streams encode with x264
 
 ## Connecting from outside your LAN
 
-You already run Tailscale. Connect the phone to the same tailnet and use the
-Tailscale IP (`100.65.7.64`) — traffic is encrypted by WireGuard; DeskLink's
-PIN handshake sits on top. `python3 -m desklink status` prints the addresses.
+Tailscale works with zero configuration: install Tailscale on the host and
+the client, connect both to your tailnet, and use the host's Tailscale IP.
+Traffic is end-to-end encrypted by WireGuard; DeskLink's PIN handshake sits
+on top. Plain port-forwarding on your router also works but exposes the
+PIN authentication directly to the internet — Tailscale is recommended.
 
 ## Security notes
 
-- The PIN is stored as `sha256(pin)` in the config (mode 0600) and used as an
-  HMAC key over a per-connection random salt — no replay, no plaintext PIN.
-- TCP traffic itself is **not** additionally encrypted. On LAN or Tailscale
-  this is fine; if you expose the port to a hostile network, wrap it (e.g.
-  `systemd-socket-proxyd` + TLS, or an SSH tunnel) — proper TLS is on the
-  roadmap.
-- File browsing is sandboxed to the roots in `config.toml` (default: `~`).
+- The PIN is stored as `sha256(pin)` (file mode 0600) and used as an HMAC
+  key over a per-connection random salt — no plaintext PIN, no replay
+- Clients are untrusted until authenticated; video only flows to
+  authenticated subscribers
+- The portal consent dialog gates every capture session; the host can never
+  capture without it
+
+## Troubleshooting
+
+- **Consent dialog on every (re)start** — XDG portal policy for
+  remote-desktop sessions; it cannot be skipped. Denied/timeout ⇒ the host
+  retries or exits
+- **Keyboard/mouse not working** — make sure the consent dialog you approved
+  included *remote control*, not just screen sharing
+- **Second stream is x264** — that's the single-NVENC-session guard; the
+  first-connected stream keeps NVENC
+- **Samsung phone kills the app in background** — add DeskLink to
+  Settings → Battery → *Never sleeping apps*
+- **No audio** — out of scope for now
 
 ## Project layout
 
 ```
 host/desklink/     Python host
   portal.py        RemoteDesktop + ScreenCast + Clipboard portal dance
-  video.py         per-monitor GStreamer pipelines, encoder fallback
+  video.py         per-client GStreamer pipelines, encoder fallback, NVENC slot
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
   displays.py      kscreen-doctor polling for live monitor changes
   viewer/          GTK4 desktop viewer (net, decode, app)
   testclient.py    reference client (dumps H.264, sends scripted input)
-android/app/       Kotlin/Compose client
+android/app/       Kotlin/Compose client (MediaCodec decode, Compose UI)
 protocol.md        wire protocol spec (source of truth for both sides)
 host/contrib/      systemd user service + autostart desktop file (optional)
 ```
 
-## Known limitations (v1)
+## Limitations / roadmap
 
-- One consent dialog per host start (portal policy, see note above).
-- No audio streaming, no session recording, no ID/relay server (use
-  Tailscale for NAT traversal).
-- The stream resolution is the monitor's physical size (e.g. 3840×2160);
-  the portal reports logical (scaled) sizes — aspect ratios match, so the
-  client maps coordinates correctly regardless. Clients learn the actual
-  encoded size (after quality caps) via `stream-info`.
-- If the portal session is revoked (e.g. via the system tray indicator),
-  the host re-requests it automatically — approve the consent dialog that
-  appears and connected clients resume. If you deny it (or 120 s pass),
-  the host exits.
+- No audio
+- One NVENC encode per process (others fall back to x264)
+- KDE-centric host (portal + kscreen-doctor); GNOME/Wayland would need a
+  display-size backend swap
+- Roadmap ideas: per-session file-transfer UI in the desktop viewer, saved
+  hosts in the viewer, audio
+
+## License
+
+MIT — see [LICENSE](LICENSE).

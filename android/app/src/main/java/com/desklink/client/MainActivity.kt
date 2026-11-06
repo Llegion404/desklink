@@ -28,7 +28,7 @@ class MainActivity : ComponentActivity() {
 
     /** Boot spec from launch extras, e.g.
      *  am start -n com.desklink.client/.MainActivity \
-     *    --es host "100.65.7.64:9090" --es pin "1234"
+     *    --es host "192.168.1.20:9090" --es pin "1234"
      * Cleared on session exit so the user lands on the connect screen. */
     private var boot by mutableStateOf<ConnSpec?>(null)
 

@@ -8,7 +8,8 @@ After=graphical-session.target
 Type=simple
 # The portal shows a consent dialog on every start (XDG policy for
 # remote-desktop sessions); this unit just restarts if it is denied.
-WorkingDirectory=%h/personal/desklink/host
+# Edit to your checkout path
+WorkingDirectory=%h/desklink/host
 ExecStart=/usr/bin/env python3 -m desklink serve
 Restart=on-failure
 RestartSec=5
