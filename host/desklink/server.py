@@ -121,6 +121,8 @@ class Client:
         self.sender = Sender(writer)
         self.authenticated = False
         self.stream: int | None = None      # subscribed stream (node_id)
+        self.quality = (server.cfg.bitrate_kbps, 0)  # (kbps, maxh) per client
+        self.pkey: tuple | None = None      # pipeline key = (node, maxh, kbps)
         self.uploads: dict[int, dict] = {}  # file_id -> {fh, path, remaining, req_id}
         self.last_json_log = 0.0
 
@@ -144,7 +146,7 @@ class DeskLinkServer:
         # indices to clients and translate at the edges. Rebuilt per session.
         self.node_to_idx: dict[int, int] = {}
         self.idx_to_node: dict[int, int] = {}
-        self._idr_last: dict[int, float] = {}
+        self._idr_last: dict[tuple, float] = {}
         self._server: asyncio.AbstractServer | None = None
         self._stopping = asyncio.Event()
         self._restarting = False
@@ -320,20 +322,21 @@ class DeskLinkServer:
                             s.width, s.height = size
             await asyncio.sleep(3.0)
 
-    def _on_stream_error(self, stream_id: int, message: str):
-        idx = self.node_to_idx.get(stream_id, stream_id)
+    def _on_stream_error(self, key: tuple, message: str):
+        idx = self.node_to_idx.get(key[0], key[0])
         for client in list(self.clients):
-            if client.stream == stream_id:
+            if client.pkey == key:
                 asyncio.ensure_future(client.sender.send_json(
                     {"type": "stream-error", "stream": idx, "msg": message}))
 
-    def _on_encoded_size(self, stream_id: int, w: int, h: int):
+    def _on_encoded_size(self, key: tuple, w: int, h: int):
         """Actual encoded resolution (after any max_h downscale) — pushed to
-        subscribed clients so they can letterbox + label correctly."""
-        idx = self.node_to_idx.get(stream_id, stream_id)
-        log.info("stream %d encoded size %dx%d", idx, w, h)
+        the clients on this pipeline so they can letterbox + label correctly."""
+        idx = self.node_to_idx.get(key[0], key[0])
+        log.info("stream %d encoded size %dx%d (key %r)", idx, w, h,
+                 (key[1], key[2]))
         for client in list(self.clients):
-            if client.authenticated and client.stream == stream_id:
+            if client.authenticated and client.pkey == key:
                 asyncio.ensure_future(client.sender.send_json(
                     {"type": "stream-info", "stream": idx, "w": w, "h": h}))
 
@@ -341,28 +344,28 @@ class DeskLinkServer:
         self._stopping.set()
 
     # ------------------------------------------------------------ fan-out
-    def _distribute(self, stream_id: int, keyframe: bool, pts_us: int, data: bytes):
+    def _distribute(self, key: tuple, keyframe: bool, pts_us: int, data: bytes):
         if not self.clients:
             return
-        idx = self.node_to_idx.get(stream_id, 0)  # compact id fits one byte
+        idx = self.node_to_idx.get(key[0], 0)  # compact id fits one byte
         payload = proto.frame(
             proto.FT_VIDEO,
             proto.video_payload(idx,
                                  proto.FLAG_KEYFRAME if keyframe else 0,
                                  pts_us, data))
         for client in self.clients:
-            if client.authenticated and client.stream == stream_id:
+            if client.authenticated and client.pkey == key:
                 dropped = client.sender.offer_video(payload)
                 if dropped:
-                    self._maybe_force_idr(stream_id)
+                    self._maybe_force_idr(key)
 
-    def _maybe_force_idr(self, stream_id: int):
+    def _maybe_force_idr(self, key: tuple):
         now = time.monotonic()
-        if now - self._idr_last.get(stream_id, 0.0) < IDR_THROTTLE:
+        if now - self._idr_last.get(key, 0.0) < IDR_THROTTLE:
             return
-        self._idr_last[stream_id] = now
+        self._idr_last[key] = now
         if self.video:
-            self.video.force_idr(stream_id)
+            self.video.force_idr(key)
 
     def _broadcast_clipboard(self, text: str):
         log.info("host clipboard changed (%d chars) -> clients", len(text))
@@ -393,8 +396,10 @@ class DeskLinkServer:
             self.clients.discard(client)
             if client.authenticated and not self.clients:
                 _desktop_notify("DeskLink", "All clients disconnected")
-            if client.stream is not None and self.video:
-                self.video.unsubscribe(client.stream)
+            if client.pkey and self.video:
+                self.video.unsubscribe(client.pkey)
+                client.stream = None
+                client.pkey = None
             for up in client.uploads.values():
                 with contextlib.suppress(Exception):
                     up["fh"].close()
@@ -466,37 +471,40 @@ class DeskLinkServer:
                      "msg": f"unknown stream {msg.get('stream')}"})
                 return
             if client.stream is not None and client.stream != node:
-                self.video.unsubscribe(client.stream)
+                if client.pkey:
+                    self.video.unsubscribe(client.pkey)
+                client.stream = None
+                client.pkey = None
             if client.stream != node:
-                self.video.subscribe(node)
+                client.pkey = self.video.subscribe(node, *client.quality)
                 client.stream = node
+                log.info("client #%d subscribed node %d (maxh %s, %d kbps)",
+                         client.id, node, client.quality[1] or "native",
+                         client.quality[0])
             await client.sender.send_json(
                 {"type": "subscribed", "stream": self.node_to_idx[node]})
         elif mtype == "set-quality":
-            kbps = int(msg.get("kbps", self.cfg.bitrate_kbps) or 8000)
-            maxh = int(msg.get("maxh", 0) or 0)
-            if self.video:
-                ok = self.video.set_quality(kbps, maxh)
-                cur_max_h = self.video.current_max_h
-            else:
-                ok, cur_max_h = False, 0
-            log.info("client #%d quality -> %d kbps, max height %s (%s)",
-                     client.id, self.cfg.bitrate_kbps,
-                     cur_max_h or "native",
-                     "ok" if ok else "queued")
+            # per-client: this client's pipeline is (re)built with its own
+            # settings; other clients keep theirs — no more global cap
+            kbps = max(500, min(50000, int(msg.get("kbps", 8000) or 8000)))
+            maxh = max(0, int(msg.get("maxh", 0) or 0))
+            if (self.video and client.stream is not None
+                    and client.pkey is not None):
+                client.pkey = self.video.move_quality(
+                    client.stream, client.pkey, kbps, maxh)
+            client.quality = (kbps, maxh)
+            log.info("client #%d quality -> %d kbps, max height %s",
+                     client.id, kbps, maxh or "native")
             await client.sender.send_json(
-                {"type": "quality", "kbps": self.cfg.bitrate_kbps,
-                 "maxh": cur_max_h, "ok": ok})
+                {"type": "quality", "kbps": kbps, "maxh": maxh, "ok": True})
         elif mtype == "unsubscribe":
-            if client.stream is not None and self.video:
-                self.video.unsubscribe(client.stream)
-                client.stream = None
-            else:
-                client.stream = None
+            if client.pkey and self.video:
+                self.video.unsubscribe(client.pkey)
+            client.stream = None
+            client.pkey = None
         elif mtype == "request-idr":
-            node = self.idx_to_node.get(int(msg.get("stream", -1)), client.stream)
-            if node is not None and self.video:
-                self.video.force_idr(node)
+            if client.pkey and self.video:
+                self.video.force_idr(client.pkey)
         elif mtype == "ping":
             await client.sender.send_json(
                 {"type": "pong", "t": msg.get("t"), "host": proto.now_ms()})

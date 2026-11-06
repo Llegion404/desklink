@@ -40,14 +40,19 @@ def _access_unit_has_idr(data: bytes) -> bool:
         i += 3
 
 
-def _encoder_chains(cfg: Config, gop: int) -> list[str]:
-    kbps = cfg.bitrate_kbps
+def _encoder_chains(cfg: Config, gop: int, kbps: int | None = None,
+                    allow_nvenc: bool = True) -> list[str]:
+    kbps = kbps or cfg.bitrate_kbps
     if cfg.encoder == "nvenc":
         candidates = ["nvh264enc"]
     elif cfg.encoder == "x264":
         candidates = ["x264enc"]
     else:
-        candidates = ["nvh264enc", "x264enc"]
+        # one NVENC session per process: creating a second while one is live
+        # segfaults the driver (SIGSEGV in nvh264enc, three times observed).
+        # Extra concurrent pipelines use x264 — cheap at capped resolutions.
+        candidates = ["nvh264enc"] if allow_nvenc else []
+        candidates.append("x264enc")
     chains = []
     for name in candidates:
         if Gst.ElementFactory.find(name) is None:
@@ -69,7 +74,8 @@ def _encoder_chains(cfg: Config, gop: int) -> list[str]:
 
 class VideoStreamPipeline:
     def __init__(self, stream: StreamInfo, fd: int, cfg: Config,
-                 on_frame, on_error, max_h: int = 0, skip_encoder: str = "",
+                 on_frame, on_error, max_h: int = 0, kbps: int = 0,
+                 skip_encoder: str = "", allow_nvenc: bool = True,
                  on_encoded_size=None, on_native_change=None,
                  on_capture_lost=None, on_retry=None):
         self.stream = stream
@@ -77,12 +83,17 @@ class VideoStreamPipeline:
         self.fd_open = True
         self.cfg = cfg
         self.max_h = max_h  # 0 = native resolution
-        self.on_frame = on_frame            # (stream_id, keyframe, pts_us, bytes)
-        self.on_error = on_error            # (stream_id, message)
-        self.on_encoded_size = on_encoded_size  # (stream_id, w, h) actual encoded
-        self.on_native_change = on_native_change  # (stream_id,) monitor res changed
-        self.on_capture_lost = on_capture_lost  # (stream_id, msg) PipeWire died
-        self.on_retry = on_retry            # (stream_id, failed_encoder, msg)
+        self.kbps = kbps or cfg.bitrate_kbps
+        # per-client pipeline identity: (node, resolution cap, bitrate) —
+        # clients with the same settings share one encode, different
+        # settings each get their own
+        self.key = (stream.node_id, max_h, self.kbps)
+        self.on_frame = on_frame            # (key, keyframe, pts_us, bytes)
+        self.on_error = on_error            # (key, message)
+        self.on_encoded_size = on_encoded_size  # (key, w, h) actual encoded
+        self.on_native_change = on_native_change  # (key,) monitor res changed
+        self.on_capture_lost = on_capture_lost  # (node_id, msg) PipeWire died
+        self.on_retry = on_retry            # (key, failed_encoder, msg)
         self.pipeline = None
         self.appsink = None
         self._bus_id = 0
@@ -94,7 +105,8 @@ class VideoStreamPipeline:
         # must NOT be compared against it directly
         self._native_dims: tuple[int, int] | None = None
         self.gop = max(1, int((cfg.framerate or 30) * cfg.gop_seconds))
-        self._candidates = [c for c in _encoder_chains(cfg, self.gop)
+        self._candidates = [c for c in _encoder_chains(cfg, self.gop, self.kbps,
+                                                       allow_nvenc)
                             if c.split()[0] != skip_encoder]
         self.encoder_name = ""
 
@@ -161,7 +173,7 @@ class VideoStreamPipeline:
                 pipeline.set_state(Gst.State.NULL)
                 log.warning("pipeline failed to play (rate-cap=%s): %s/%s",
                             rate, ok, state)
-        self.on_error(self.stream.node_id, "no encoder pipeline could start")
+        self.on_error(self.key, "no encoder pipeline could start")
         return False
 
     def stop(self):
@@ -220,7 +232,7 @@ class VideoStreamPipeline:
             if w and h and (w, h) != self._enc_dims:
                 self._enc_dims = (w, h)
                 if self.on_encoded_size:
-                    self.on_encoded_size(self.stream.node_id, int(w), int(h))
+                    self.on_encoded_size(self.key, int(w), int(h))
         buf = sample.get_buffer()
         ok, map_info = buf.map(Gst.MapFlags.READ)
         if not ok:
@@ -232,7 +244,7 @@ class VideoStreamPipeline:
             # config-interval=-1 SPS/PPS precede every IDR.
             data = map_info.data
             keyframe = _access_unit_has_idr(data)
-            self.on_frame(self.stream.node_id, keyframe, pts // 1000, data)
+            self.on_frame(self.key, keyframe, pts // 1000, data)
         finally:
             buf.unmap(map_info)
         return Gst.FlowReturn.OK
@@ -274,7 +286,7 @@ class VideoStreamPipeline:
     def _fire_native_change(self):
         self._rebuild_timer = 0
         if self.on_native_change:
-            self.on_native_change(self.stream.node_id)
+            self.on_native_change(self.key)
 
     def _on_bus_error(self, bus, message):
         err, debug = message.parse_error()
@@ -296,9 +308,9 @@ class VideoStreamPipeline:
             return
         # retry bookkeeping lives in VideoManager (it owns the pipeline table)
         if self.on_retry:
-            self.on_retry(self.stream.node_id, self.encoder_name, err.message)
+            self.on_retry(self.key, self.encoder_name, err.message)
         else:
-            self.on_error(self.stream.node_id, err.message)
+            self.on_error(self.key, err.message)
 
     def force_idr(self):
         if not self.pipeline:
@@ -323,150 +335,181 @@ class GLibError(Exception):
 
 
 class VideoManager:
-    """Lazy per-stream pipelines + fan-out bookkeeping."""
+    """Per-(stream, quality) pipelines + fan-out bookkeeping.
+
+    Pipeline identity is `key = (node_id, max_h, kbps)`: clients with the
+    same settings share one encode; a client changing quality moves to
+    another pipeline while everyone else keeps theirs.
+    """
 
     def __init__(self, glib: GLibRunner, cfg: Config):
         self.glib = glib
         self.cfg = cfg
         self.session = None
         self.streams: list[StreamInfo] = []
-        self.on_frame = None          # (stream_id, keyframe, pts_us, bytes)
-        self.on_stream_error = None   # (stream_id, message)
-        self.on_encoded_size = None   # (stream_id, w, h) actual encoded size
-        self.on_capture_lost = None   # (stream_id, msg) capture session gone
-        self._pipelines: dict[int, VideoStreamPipeline] = {}
-        self._refcounts: dict[int, int] = {}
-        self._retries: dict[int, int] = {}
-        self.current_max_h = 0        # resolution cap; 0 = native
+        self.on_frame = None          # (key, keyframe, pts_us, bytes)
+        self.on_stream_error = None   # (key, message)
+        self.on_encoded_size = None   # (key, w, h) actual encoded size
+        self.on_capture_lost = None   # (node_id, msg) capture session gone
+        self._pipelines: dict[tuple, VideoStreamPipeline] = {}
+        self._refcounts: dict[tuple, int] = {}
+        self._retries: dict[tuple, int] = {}
+        # NVENC slot: key of the one pipeline allowed to use nvh264enc.
+        # Two concurrent NVENC sessions segfault the driver, so every other
+        # concurrent pipeline runs x264.
+        self._nvenc_key: tuple | None = None
 
     def setup(self, session):
         self.session = session
         self.streams = session.streams
 
-    def subscribe(self, stream_id: int):
+    def subscribe(self, stream_id: int, kbps: int = 0, max_h: int = 0) -> tuple:
+        """Increment the refcount for this client key and start the pipeline
+        if it is the first subscriber. Returns the pipeline key."""
+        kbps = kbps or self.cfg.bitrate_kbps
+        key = (stream_id, max_h, kbps)
         if stream_id not in {s.node_id for s in self.streams}:
-            return
-        self._refcounts[stream_id] = self._refcounts.get(stream_id, 0) + 1
-        if self._refcounts[stream_id] == 1:
+            return key
+        self._refcounts[key] = self._refcounts.get(key, 0) + 1
+        if self._refcounts[key] == 1:
             try:
-                pipe = self._make_pipeline(stream_id)
+                pipe = self._make_pipeline(key)
             except Exception:
                 # never leave the refcount incremented — the next subscriber
                 # must still get a pipeline
-                log.exception("pipeline creation failed for stream %d",
-                              stream_id)
-                self._refcounts.pop(stream_id, None)
-                self._fail_stream(stream_id, "pipeline creation failed")
-                return
+                log.exception("pipeline creation failed for %r", (key,))
+                self._refcounts.pop(key, None)
+                self._fail_stream(key, "pipeline creation failed")
+                return key
             self.glib.submit(pipe.start)
+            if key == self._nvenc_key:
+                # if the pipeline fell back to x264, free the NVENC slot
+                self.glib.submit(self._verify_nvenc_claim, key, pipe)
+        return key
 
-    def _make_pipeline(self, stream_id: int, skip_encoder: str = "",
-                       fresh_retry: bool = True) -> VideoStreamPipeline:
-        info = next(s for s in self.streams if s.node_id == stream_id)
+    def _verify_nvenc_claim(self, key: tuple, pipe: VideoStreamPipeline):
+        if self._nvenc_key == key and pipe.encoder_name != "nvh264enc":
+            self._nvenc_key = None
+
+    def _make_pipeline(self, key: tuple, skip_encoder: str = "",
+                       fresh_retry: bool = True,
+                       no_nvenc: bool = False) -> VideoStreamPipeline:
+        node_id, max_h, kbps = key
+        info = next(s for s in self.streams if s.node_id == node_id)
         fd = os.dup(self.session.pw_fd)
         if fresh_retry:
-            self._retries.pop(stream_id, None)
+            self._retries.pop(key, None)
+        # claim the single NVENC slot synchronously (no claim: x264)
+        allow_nvenc = (self._nvenc_key is None) and not no_nvenc
+        if allow_nvenc:
+            self._nvenc_key = key
         pipe = VideoStreamPipeline(info, fd, self.cfg, self._frame,
                                    self._fail_stream,
-                                   max_h=self.current_max_h,
+                                   max_h=max_h, kbps=kbps,
                                    skip_encoder=skip_encoder,
+                                   allow_nvenc=allow_nvenc,
                                    on_encoded_size=self._encoded_size,
                                    on_native_change=self._native_change,
                                    on_capture_lost=self._capture_lost,
                                    on_retry=self._retry)
-        self._pipelines[stream_id] = pipe
+        self._pipelines[key] = pipe
         return pipe
 
-    def _fail_stream(self, sid: int, msg: str):
-        log.error("stream %d fatal: %s", sid, msg)
+    def _fail_stream(self, key: tuple, msg: str):
+        log.error("stream %r fatal: %s", (key,), msg)
         if self.on_stream_error:
-            self.on_stream_error(sid, msg)
+            self.on_stream_error(key, msg)
 
-    def _encoded_size(self, sid: int, w: int, h: int):
+    def _encoded_size(self, key: tuple, w: int, h: int):
         if self.on_encoded_size:
-            self.on_encoded_size(sid, w, h)
+            self.on_encoded_size(key, w, h)
 
-    def _capture_lost(self, sid: int, msg: str):
-        log.error("capture lost on node %d: %s", sid, msg)
+    def _capture_lost(self, node_id: int, msg: str):
+        log.error("capture lost on node %d: %s", node_id, msg)
         if self.on_capture_lost:
-            self.on_capture_lost(sid, msg)
+            self.on_capture_lost(node_id, msg)
 
-    def _native_change(self, sid: int):
+    def _native_change(self, key: tuple):
         """GLib thread: monitor resolution changed — rebuild this pipeline so
         scale caps / encoder match the new native size."""
-        if sid in self._pipelines:
-            self._rebuild(sid)
+        if key in self._pipelines:
+            self._rebuild(key)
 
-    def _retry(self, sid: int, failed_encoder: str, msg: str):
+    def _retry(self, key: tuple, failed_encoder: str, msg: str):
         """GLib thread: bus error on a running pipeline — one fallback-encoder
         retry, then give up (client gets stream-error)."""
-        if sid not in self._pipelines:
+        if key not in self._pipelines:
             return
-        retries = self._retries.get(sid, 0)
+        retries = self._retries.get(key, 0)
         if retries >= 1:
-            self._pipelines.pop(sid, None)
-            self._retries.pop(sid, None)
-            self._fail_stream(sid, msg)
+            self._pipelines.pop(key, None)
+            self._retries.pop(key, None)
+            self._fail_stream(key, msg)
             return
-        self._retries[sid] = retries + 1
-        log.info("stream %d retrying with fallback encoder (dropped %s)",
-                 sid, failed_encoder or "?")
-        self._make_pipeline(sid, skip_encoder=failed_encoder,
-                            fresh_retry=False).start()
+        self._retries[key] = retries + 1
+        dropped_nvenc = failed_encoder == "nvh264enc"
+        if self._nvenc_key == key:
+            self._nvenc_key = None   # re-claimed below unless nvenc dropped
+        log.info("stream %r retrying with fallback encoder (dropped %s)",
+                 (key,), failed_encoder or "?")
+        self._make_pipeline(key, skip_encoder=failed_encoder,
+                            fresh_retry=False,
+                            no_nvenc=dropped_nvenc).start()
 
-    def unsubscribe(self, stream_id: int):
-        count = self._refcounts.get(stream_id, 0)
+    def unsubscribe(self, key: tuple):
+        count = self._refcounts.get(key, 0)
         if count <= 1:
-            self._refcounts.pop(stream_id, None)
-            self._retries.pop(stream_id, None)
-            pipe = self._pipelines.pop(stream_id, None)
+            self._refcounts.pop(key, None)
+            self._retries.pop(key, None)
+            pipe = self._pipelines.pop(key, None)
             if pipe:
-                self.glib.submit(pipe.stop)
+                if self._nvenc_key == key:
+                    # release the NVENC slot only after the pipeline has
+                    # fully stopped (GLib thread, ordered before any start)
+                    def _stop_and_release():
+                        pipe.stop()
+                        if self._nvenc_key == key:
+                            self._nvenc_key = None
+                    self.glib.submit(_stop_and_release)
+                else:
+                    self.glib.submit(pipe.stop)
         elif count:
-            self._refcounts[stream_id] = count - 1
+            self._refcounts[key] = count - 1
 
-    def _frame(self, stream_id: int, keyframe: bool, pts_us: int, data: bytes):
+    def move_quality(self, stream_id: int, old_key: tuple,
+                     kbps: int, max_h: int) -> tuple:
+        """Move one client from its current pipeline to one with new
+        settings. Sequential on the GLib thread so encoder teardown and init
+        never race (NVENC SIGSEGV lesson). Returns the new key."""
+        if old_key[0] != stream_id:
+            return old_key
+        if self._nvenc_key == old_key:
+            # synchronous release: the old pipeline's stop is queued on the
+            # GLib thread immediately after, before any new start can run,
+            # so the replacement gets a clean NVENC session
+            self._nvenc_key = None
+        self.unsubscribe(old_key)
+        return self.subscribe(stream_id, kbps, max_h)
+
+    def _frame(self, key: tuple, keyframe: bool, pts_us: int, data: bytes):
         if self.on_frame:
-            self.on_frame(stream_id, keyframe, pts_us, data)
+            self.on_frame(key, keyframe, pts_us, data)
 
-    def force_idr(self, stream_id: int):
-        pipe = self._pipelines.get(stream_id)
+    def force_idr(self, key: tuple):
+        pipe = self._pipelines.get(key)
         if pipe:
             self.glib.submit(pipe.force_idr)
 
-    def set_bitrate(self, kbps: int) -> bool:
-        return self.set_quality(kbps, self.current_max_h)
-
-    def set_quality(self, kbps: int, max_h: int = 0) -> bool:
-        """Live quality change: bitrate on the running encoders, and — when
-        the resolution cap changes — pipelines are rebuilt (scaled) for every
-        subscribed stream."""
-        kbps = max(500, min(50000, int(kbps)))
-        max_h = max(0, int(max_h))
-        res_changed = max_h != self.current_max_h
-        self.current_max_h = max_h
-        self.cfg.bitrate_kbps = kbps  # in-memory; future pipelines match
-        for sid in list(self._pipelines):
-            pipe = self._pipelines.get(sid)
-            if pipe is None:
-                continue
-            if res_changed:
-                # rebuild on the GLib thread: NVENC teardown on the asyncio
-                # thread while GLib-side callbacks touch the old pipeline
-                # segfaulted the driver (SIGSEGV, silent process death)
-                self.glib.submit(self._rebuild, sid)
-            else:
-                self.glib.submit(pipe.set_bitrate, kbps)
-        return True
-
-    def _rebuild(self, sid: int):
-        """GLib thread: stop + fresh pipeline (quality cap change, monitor
-        resolution change, encoder fallback). Everything on one thread so
-        encoder teardown and init never race."""
-        pipe = self._pipelines.get(sid)
+    def _rebuild(self, key: tuple):
+        """GLib thread: stop + fresh pipeline (monitor resolution change,
+        encoder fallback). Everything on one thread so encoder teardown and
+        init never race."""
+        pipe = self._pipelines.get(key)
         if pipe is not None:
             pipe.stop()
-        self._make_pipeline(sid).start()
+        if self._nvenc_key == key:
+            self._nvenc_key = None   # _make_pipeline re-claims the slot
+        self._make_pipeline(key).start()
 
     def stop_all(self):
         for pipe in list(self._pipelines.values()):
@@ -474,3 +517,4 @@ class VideoManager:
         self._pipelines.clear()
         self._refcounts.clear()
         self._retries.clear()
+        self._nvenc_key = None

@@ -45,7 +45,7 @@ reported by the portal; the video itself may be higher resolution.
 | `subscribe` | `stream` | receive video for that stream (one at a time) |
 | `unsubscribe` | | stop receiving video |
 | `request-idr` | `stream` | force a keyframe (after lag/switch) |
-| `set-quality` | `kbps` | change encoder bitrate live (min 500, max 50000) |
+| `set-quality` | `kbps, maxh` | **per-client** quality: this client's pipelines use these settings (bitrate 500–50000; `maxh` 0 = native). Other clients are unaffected. Clients with identical settings share one encode. |
 | `motion` | `stream, x, y` | absolute pointer, x/y normalized 0..1 in stream space |
 | `button` | `btn: left\|right\|middle, down: bool` | pointer button |
 | `scroll` | `dx, dy` | discrete wheel steps |
@@ -62,8 +62,8 @@ reported by the portal; the video itself may be higher resolution.
 ## Server → client JSON
 
 `hello`, `deny`, `pong` (echoes `t`), `clip` (`text`),
-`quality` (`kbps, maxh, ok`) in reply to `set-quality` (`maxh` is the active
-resolution cap, 0 = native),
+`quality` (`kbps, maxh, ok`) in reply to `set-quality`, echoing the
+client's own settings,
 `stream-info` (`stream, w, h` — the actual encoded resolution of the
 subscribed stream, sent whenever it becomes known or changes: after
 subscribe, after a quality change that alters the scale, and after a monitor
