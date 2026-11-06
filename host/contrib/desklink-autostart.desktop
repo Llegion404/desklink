@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DeskLink Host
+Comment=Remote desktop host for DeskLink clients
+TryExec=/usr/bin/python3
+Exec=python3 -m desklink serve
+WorkingDirectory=/home/paradox/personal/desklink/host
+Terminal=false
+X-GNOME-Autostart-enabled=false

@@ -1,0 +1,601 @@
+"""Asyncio TCP server tying everything together.
+
+Per client: PIN challenge-response handshake, control-message dispatch
+(input / clipboard / files / stream subscription), and a Sender that
+multiplexes video (lossy, drop-oldest) and data frames (lossless,
+backpressured) onto the socket.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import time
+from collections import deque
+
+from . import config as cfgmod
+from . import displays
+from . import protocol as proto
+from .clipboard import ClipboardBridge
+from .files import FileManager, SandboxViolation
+from .glibloop import GLibRunner
+from .input import InputRouter
+from .portal import Portal, PortalSession, UserCancelled
+from .video import VideoManager
+
+log = logging.getLogger("desklink.server")
+
+AUTH_TIMEOUT = 10.0
+VIDEO_QUEUE = 30            # ~1s at 30fps — shallow so drops happen here,
+                            # not in TCP buffers (relay paths bufferbloat)
+IDR_THROTTLE = 1.0          # seconds between forced keyframes (large frames —
+                            # forcing them often amplifies congestion)
+
+
+def _desktop_notify(title: str, body: str, urgent: bool = False):
+    """Best-effort libnotify popup (QoL: see who is connected)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "DeskLink", "-t", "4000"] +
+            (["-u", "critical"] if urgent else []) + [title, body],
+            timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+class Sender:
+    """Lossy video lane + lossless data lane over one StreamWriter."""
+
+    def __init__(self, writer: asyncio.StreamWriter):
+        self.writer = writer
+        self.video: deque[bytes] = deque()
+        self.data: asyncio.Queue = asyncio.Queue(maxsize=32)
+        self._wakeup = asyncio.Event()
+        self.closed = False
+        self.bytes_out = 0
+        self.frames_out = 0
+        self.dropped = 0
+        self._task = asyncio.create_task(self._run())
+
+    def offer_video(self, payload: bytes) -> bool:
+        """Queue a video frame. Returns True if an older frame was dropped."""
+        self.video.append(payload)
+        if len(self.video) > VIDEO_QUEUE:
+            self.video.popleft()
+            self.dropped += 1
+            self._wakeup.set()
+            return True
+        self._wakeup.set()
+        return False
+
+    async def put_data(self, payload: bytes):
+        await self.data.put(payload)
+        self._wakeup.set()
+
+    async def send_json(self, obj: dict):
+        await self.put_data(proto.json_message(obj))
+
+    async def _run(self):
+        try:
+            while True:
+                await self._wakeup.wait()
+                self._wakeup.clear()
+                while self.video:
+                    payload = self.video.popleft()
+                    self.writer.write(payload)
+                    self.bytes_out += len(payload)
+                    self.frames_out += 1
+                while not self.data.empty():
+                    payload = self.data.get_nowait()
+                    self.writer.write(payload)
+                    self.bytes_out += len(payload)
+                await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            pass
+        except Exception:
+            log.exception("sender loop crashed")
+        finally:
+            with contextlib.suppress(Exception):
+                self.writer.close()
+
+    async def close(self):
+        self.closed = True
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+
+
+class Client:
+    _next_id = 1
+
+    def __init__(self, server: "DeskLinkServer", writer: asyncio.StreamWriter):
+        self.id = Client._next_id
+        Client._next_id += 1
+        self.server = server
+        self.writer = writer
+        self.addr = writer.get_extra_info("peername")
+        self.sender = Sender(writer)
+        self.authenticated = False
+        self.stream: int | None = None      # subscribed stream (node_id)
+        self.uploads: dict[int, dict] = {}  # file_id -> {fh, path, remaining, req_id}
+        self.last_json_log = 0.0
+
+    @property
+    def alive(self) -> bool:
+        return not self.sender._task.done()
+
+
+class DeskLinkServer:
+    def __init__(self, cfg: cfgmod.Config):
+        self.cfg = cfg
+        self.glib: GLibRunner | None = None
+        self.session: PortalSession | None = None
+        self.video: VideoManager | None = None
+        self.input: InputRouter | None = None
+        self.clipboard: ClipboardBridge | None = None
+        self.files = FileManager(cfg.fs_roots(), cfg.downloads_path)
+        self.clients: set[Client] = set()
+        # PipeWire node ids are unbounded (this session: 299/301) but the
+        # wire format carries stream ids in one byte — expose compact
+        # indices to clients and translate at the edges. Rebuilt per session.
+        self.node_to_idx: dict[int, int] = {}
+        self.idx_to_node: dict[int, int] = {}
+        self._idr_last: dict[int, float] = {}
+        self._server: asyncio.AbstractServer | None = None
+        self._stopping = asyncio.Event()
+        self._restarting = False
+        self._aloop: asyncio.AbstractEventLoop | None = None
+        self._display_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------ lifecycle
+    async def run(self) -> int:
+        aloop = asyncio.get_running_loop()
+        self.glib = GLibRunner(aloop)
+        self.glib.start()
+        self._aloop = aloop
+        try:
+            await self._start_portal_session()
+            self._server = await asyncio.start_server(
+                self._handle_client, host="0.0.0.0", port=self.cfg.port)
+            log.info("listening on 0.0.0.0:%d (streams: %s)",
+                     self.cfg.port,
+                     [f"{s.node_id}:{s.width}x{s.height}" for s in self.session.streams])
+            await self._stopping.wait()
+            return 0
+        finally:
+            await self.shutdown()
+
+    async def _start_portal_session(self):
+        """Request a portal session and (re)wire everything that depends on
+        it. Also used by the auto-restart path after a session dies; keeps
+        TCP clients connected and re-announces streams via a fresh hello."""
+        aloop = self._aloop
+        portal = Portal(self.glib, aloop)
+        log.info("requesting remote-desktop portal session "
+                 "(consent dialog may appear)...")
+        session = await portal.start(allow_clipboard=self.cfg.allow_clipboard)
+        self.session = session
+        session.on_closed = lambda: aloop.call_soon_threadsafe(
+            self._on_session_closed)
+
+        self.video = VideoManager(self.glib, self.cfg)
+        self.video.setup(session)
+        self.node_to_idx = {s.node_id: i for i, s in enumerate(session.streams)}
+        self.idx_to_node = {i: s.node_id for i, s in enumerate(session.streams)}
+        self.video.on_frame = lambda sid, kf, pts, data: \
+            aloop.call_soon_threadsafe(self._distribute, sid, kf, pts, data)
+        self.video.on_stream_error = self._on_stream_error
+        self.video.on_encoded_size = lambda sid, w, h: \
+            aloop.call_soon_threadsafe(self._on_encoded_size, sid, w, h)
+        self.video.on_capture_lost = lambda sid, msg: \
+            aloop.call_soon_threadsafe(self._on_capture_lost, sid, msg)
+
+        self.input = InputRouter(session, self.glib)
+
+        if session.clipboard_requested and self.cfg.allow_clipboard:
+            self.clipboard = ClipboardBridge(
+                session,
+                on_text=lambda text: aloop.call_soon_threadsafe(
+                    self._broadcast_clipboard, text))
+
+        # clients that survived a session restart re-announce + resubscribe
+        hello = self._hello_msg()
+        for client in list(self.clients):
+            if client.authenticated:
+                await client.sender.send_json(hello)
+
+        if displays.kscreen_available():
+            if self._display_task:
+                self._display_task.cancel()
+            self._display_task = asyncio.ensure_future(self._poll_display_sizes())
+
+    def _hello_msg(self) -> dict:
+        return {
+            "type": "hello",
+            "v": proto.PROTO_VERSION,
+            "host": self.cfg.name,
+            "clipboard": bool(self.clipboard and self.clipboard.enabled),
+            "streams": [{"id": self.node_to_idx[s.node_id],
+                         "w": s.width, "h": s.height,
+                         "x": s.x, "y": s.y} for s in self.session.streams],
+        }
+
+    def _teardown_session_objects(self):
+        """Tear down everything bound to the current portal session (safe to
+        call repeatedly; nulls refs so request paths can guard on them)."""
+        if self._display_task:
+            self._display_task.cancel()
+            self._display_task = None
+        if self.input:
+            self.input.release_all()
+            self.input = None
+        if self.video:
+            self.video.stop_all()
+            self.video = None
+        if self.clipboard:
+            self.clipboard.close()
+            self.clipboard = None
+        if self.session:
+            self.session.close()
+            self.session = None
+        self.node_to_idx = {}
+        self.idx_to_node = {}
+
+    async def shutdown(self):
+        log.info("shutting down")
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        for client in list(self.clients):
+            with contextlib.suppress(Exception):
+                await client.sender.send_json({"type": "bye", "msg": "server stopping"})
+                await asyncio.wait_for(client.sender.close(), 2)
+        self._teardown_session_objects()
+        if self.glib:
+            await asyncio.sleep(0.1)
+            self.glib.stop()
+
+    def _on_session_closed(self):
+        if self._stopping.is_set() or self._restarting:
+            return
+        log.warning("portal session closed; re-requesting a new session")
+        self._teardown_session_objects()
+        for client in list(self.clients):
+            with contextlib.suppress(Exception):
+                asyncio.ensure_future(client.sender.send_json(
+                    {"type": "host-error",
+                     "msg": "display session closed — re-requesting "
+                            "(approve the dialog)"}))
+        self._restarting = True
+        asyncio.ensure_future(self._restart_portal())
+
+    def _on_capture_lost(self, stream_id: int, message: str):
+        """PipeWire capture died (portal backend crash or a stream revoked
+        without a Closed signal) — same recovery as a closed session."""
+        log.warning("capture lost on node %d (%s); treating as session loss",
+                    stream_id, message)
+        self._on_session_closed()
+
+    async def _restart_portal(self):
+        try:
+            await asyncio.wait_for(self._start_portal_session(), timeout=120)
+            log.info("portal session restored; clients can resume")
+        except Exception as exc:
+            log.error("portal re-request failed: %s", exc)
+            for client in list(self.clients):
+                with contextlib.suppress(Exception):
+                    await client.sender.send_json(
+                        {"type": "host-error",
+                         "msg": f"portal re-request failed — stopping ({exc})"})
+            self._stopping.set()
+        finally:
+            self._restarting = False
+
+    async def _poll_display_sizes(self):
+        """KWin keeps screencast streams alive across monitor mode changes
+        (it scales into the negotiated buffer), so video survives — but the
+        *logical* desktop size changes and input mapping scales normalized
+        coordinates into it. No D-Bus signal exists for that, so poll
+        kscreen-doctor while someone is subscribed."""
+        await asyncio.sleep(2.0)
+        while not self._stopping.is_set():
+            if (self.session is not None and self.video is not None
+                    and any(c.stream is not None for c in self.clients)):
+                try:
+                    geoms = await asyncio.to_thread(
+                        displays.query_output_geometries)
+                except Exception:
+                    geoms = {}
+                if geoms and self.session is not None:
+                    for s in self.session.streams:
+                        size = displays.match_stream(s, geoms)
+                        if size and (s.width, s.height) != size:
+                            log.info("stream node %d logical size %dx%d -> "
+                                     "%dx%d (display changed)",
+                                     s.node_id, s.width, s.height, *size)
+                            s.width, s.height = size
+            await asyncio.sleep(3.0)
+
+    def _on_stream_error(self, stream_id: int, message: str):
+        idx = self.node_to_idx.get(stream_id, stream_id)
+        for client in list(self.clients):
+            if client.stream == stream_id:
+                asyncio.ensure_future(client.sender.send_json(
+                    {"type": "stream-error", "stream": idx, "msg": message}))
+
+    def _on_encoded_size(self, stream_id: int, w: int, h: int):
+        """Actual encoded resolution (after any max_h downscale) — pushed to
+        subscribed clients so they can letterbox + label correctly."""
+        idx = self.node_to_idx.get(stream_id, stream_id)
+        log.info("stream %d encoded size %dx%d", idx, w, h)
+        for client in list(self.clients):
+            if client.authenticated and client.stream == stream_id:
+                asyncio.ensure_future(client.sender.send_json(
+                    {"type": "stream-info", "stream": idx, "w": w, "h": h}))
+
+    def stop(self):
+        self._stopping.set()
+
+    # ------------------------------------------------------------ fan-out
+    def _distribute(self, stream_id: int, keyframe: bool, pts_us: int, data: bytes):
+        if not self.clients:
+            return
+        idx = self.node_to_idx.get(stream_id, 0)  # compact id fits one byte
+        payload = proto.frame(
+            proto.FT_VIDEO,
+            proto.video_payload(idx,
+                                 proto.FLAG_KEYFRAME if keyframe else 0,
+                                 pts_us, data))
+        for client in self.clients:
+            if client.authenticated and client.stream == stream_id:
+                dropped = client.sender.offer_video(payload)
+                if dropped:
+                    self._maybe_force_idr(stream_id)
+
+    def _maybe_force_idr(self, stream_id: int):
+        now = time.monotonic()
+        if now - self._idr_last.get(stream_id, 0.0) < IDR_THROTTLE:
+            return
+        self._idr_last[stream_id] = now
+        if self.video:
+            self.video.force_idr(stream_id)
+
+    def _broadcast_clipboard(self, text: str):
+        log.info("host clipboard changed (%d chars) -> clients", len(text))
+        for client in list(self.clients):
+            if client.authenticated:
+                asyncio.ensure_future(client.sender.send_json(
+                    {"type": "clip", "text": text}))
+
+    # ------------------------------------------------------------ clients
+    async def _handle_client(self, reader: asyncio.StreamReader,
+                             writer: asyncio.StreamWriter):
+        client = Client(self, writer)
+        self.clients.add(client)
+        log.info("client #%d connected from %s", client.id, client.addr)
+        try:
+            ok, msg = await self._handshake(reader, writer, client)
+            if not ok:
+                return
+            await self._client_loop(reader, client)
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            pass
+        except Exception:
+            log.exception("client #%d handler error", client.id)
+        finally:
+            log.info("client #%d disconnected (out %d KB, %d frames, %d dropped)",
+                     client.id, client.sender.bytes_out // 1024,
+                     client.sender.frames_out, client.sender.dropped)
+            self.clients.discard(client)
+            if client.authenticated and not self.clients:
+                _desktop_notify("DeskLink", "All clients disconnected")
+            if client.stream is not None and self.video:
+                self.video.unsubscribe(client.stream)
+            for up in client.uploads.values():
+                with contextlib.suppress(Exception):
+                    up["fh"].close()
+            # never leave injected inputs held down on the desktop
+            if self.input:
+                self.glib.submit(self.input.release_all)
+            await client.sender.close()
+
+    async def _handshake(self, reader, writer, client) -> tuple[bool, str]:
+        salt = proto.new_salt()
+        writer.write(proto.json_message(
+            {"type": "greet", "v": proto.PROTO_VERSION, "salt": salt,
+             "name": self.cfg.name}))
+        await writer.drain()
+        try:
+            ftype, payload = await asyncio.wait_for(
+                proto.read_frame(reader), AUTH_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False, "auth timeout"
+        if ftype != proto.FT_JSON:
+            return False, "expected auth"
+        msg = json.loads(payload)
+        if msg.get("type") != "auth":
+            return False, "expected auth"
+        if self.cfg.pin_key is None:
+            await client.sender.send_json(
+                {"type": "deny", "msg": "no PIN configured; run desklink set-pin"})
+            return False, "no pin"
+        if not proto.verify_mac(self.cfg.pin_key, salt, str(msg.get("mac", ""))):
+            await client.sender.send_json({"type": "deny", "msg": "bad pin"})
+            log.warning("client #%d failed auth", client.id)
+            return False, "bad pin"
+        client.authenticated = True
+        _desktop_notify("DeskLink",
+                        f"Client connected from {client.addr[0]} "
+                        f"({msg.get('client', '?')})")
+        # during a portal re-request there is no session yet — hold the hello
+        # briefly so clients survive the consent-dialog gap, then give up
+        # (they see "connection lost" and auto-retry)
+        for _ in range(90):
+            if self.session is not None or self._stopping.is_set():
+                break
+            await asyncio.sleep(0.5)
+        if self.session is None:
+            log.info("client #%d dropping: no display session available",
+                     client.id)
+            return False, "no display session"
+        await client.sender.send_json(self._hello_msg())
+        log.info("client #%d authenticated (%s)", client.id, msg.get("client", "?"))
+        return True, "ok"
+
+    async def _client_loop(self, reader, client):
+        while True:
+            ftype, payload = await proto.read_frame(reader)
+            if ftype == proto.FT_JSON:
+                await self._handle_control(json.loads(payload), client)
+            elif ftype == proto.FT_FILE:
+                self._handle_file_chunk(payload, client)
+            # video/clipboard frames from clients are ignored
+
+    # ------------------------------------------------------------ control
+    async def _handle_control(self, msg: dict, client: Client):
+        mtype = msg.get("type")
+        if mtype == "subscribe":
+            node = self.idx_to_node.get(int(msg.get("stream", -1)))
+            if node is None or not self.video:
+                await client.sender.send_json(
+                    {"type": "stream-error", "stream": msg.get("stream"),
+                     "msg": f"unknown stream {msg.get('stream')}"})
+                return
+            if client.stream is not None and client.stream != node:
+                self.video.unsubscribe(client.stream)
+            if client.stream != node:
+                self.video.subscribe(node)
+                client.stream = node
+            await client.sender.send_json(
+                {"type": "subscribed", "stream": self.node_to_idx[node]})
+        elif mtype == "set-quality":
+            kbps = int(msg.get("kbps", self.cfg.bitrate_kbps) or 8000)
+            maxh = int(msg.get("maxh", 0) or 0)
+            if self.video:
+                ok = self.video.set_quality(kbps, maxh)
+                cur_max_h = self.video.current_max_h
+            else:
+                ok, cur_max_h = False, 0
+            log.info("client #%d quality -> %d kbps, max height %s (%s)",
+                     client.id, self.cfg.bitrate_kbps,
+                     cur_max_h or "native",
+                     "ok" if ok else "queued")
+            await client.sender.send_json(
+                {"type": "quality", "kbps": self.cfg.bitrate_kbps,
+                 "maxh": cur_max_h, "ok": ok})
+        elif mtype == "unsubscribe":
+            if client.stream is not None and self.video:
+                self.video.unsubscribe(client.stream)
+                client.stream = None
+            else:
+                client.stream = None
+        elif mtype == "request-idr":
+            node = self.idx_to_node.get(int(msg.get("stream", -1)), client.stream)
+            if node is not None and self.video:
+                self.video.force_idr(node)
+        elif mtype == "ping":
+            await client.sender.send_json(
+                {"type": "pong", "t": msg.get("t"), "host": proto.now_ms()})
+        elif mtype in ("motion", "button", "scroll", "key", "keysym", "text"):
+            if self.input is None:
+                return
+            if mtype == "motion":
+                msg["stream"] = self.idx_to_node.get(
+                    int(msg.get("stream", -1)),
+                    next(iter(self.node_to_idx), None))
+            await self.input.handle(msg)
+        elif mtype == "clip-set":
+            if self.clipboard and self.clipboard.enabled:
+                text = str(msg.get("text", ""))[:1_000_000]
+                self.glib.submit(self.clipboard.set_text, text)
+        elif mtype == "fs-list":
+            reply = self.files.list_dir(str(msg.get("path", "~")))
+            reply.update({"type": "fs-list-reply", "id": msg.get("id")})
+            await client.sender.send_json(reply)
+        elif mtype == "fs-get":
+            await self._serve_file(msg, client)
+        elif mtype == "fs-put":
+            await self._begin_upload(msg, client)
+        elif mtype == "fs-put-end":
+            await self._end_upload(msg, client)
+        elif mtype == "bye":
+            raise ConnectionResetError("client said bye")
+        else:
+            log.debug("client #%d unknown message %r", client.id, mtype)
+
+    # ------------------------------------------------------------ files
+    async def _serve_file(self, msg: dict, client: Client):
+        req_id = int(msg.get("id", 0))
+        try:
+            path, size = self.files.open_read(str(msg.get("path", "")))
+        except (SandboxViolation, OSError) as exc:
+            await client.sender.send_json(
+                {"type": "fs-error", "id": req_id, "msg": str(exc)})
+            return
+        await client.sender.send_json(
+            {"type": "fs-data-begin", "id": req_id, "size": size,
+             "name": path.name, "path": str(path)})
+        fh = await asyncio.get_running_loop().run_in_executor(None, open, path, "rb")
+        try:
+            while True:
+                chunk = await asyncio.get_running_loop().run_in_executor(
+                    None, fh.read, self.files.CHUNK)
+                if not chunk:
+                    break
+                await client.sender.put_data(
+                    proto.frame(proto.FT_FILE, proto.file_payload(req_id & 0xFFFFFFFF, chunk)))
+            await client.sender.send_json({"type": "fs-data-end", "id": req_id})
+            log.info("served %s (%d bytes) to client #%d", path, size, client.id)
+        finally:
+            fh.close()
+
+    async def _begin_upload(self, msg: dict, client: Client):
+        req_id = int(msg.get("id", 0))
+        size = int(msg.get("size", 0))
+        try:
+            target = self.files.open_write(str(msg.get("name", "upload.bin")))
+            fh = open(target, "wb")
+        except OSError as exc:
+            await client.sender.send_json(
+                {"type": "fs-error", "id": req_id, "msg": str(exc)})
+            return
+        client.uploads[req_id] = {"fh": fh, "path": target,
+                                  "remaining": size, "req_id": req_id}
+        await client.sender.send_json({"type": "fs-put-ack", "id": req_id, "ok": True})
+
+    def _handle_file_chunk(self, payload: bytes, client: Client):
+        file_id, chunk = proto.parse_file_payload(payload)
+        up = client.uploads.get(file_id)
+        if up is None:
+            return
+        up["fh"].write(chunk)
+        up["remaining"] -= len(chunk)
+
+    async def _end_upload(self, msg: dict, client: Client):
+        req_id = int(msg.get("id", 0))
+        up = client.uploads.pop(req_id, None)
+        if up is None:
+            return
+        up["fh"].close()
+        await client.sender.send_json(
+            {"type": "fs-put-done", "id": req_id, "path": str(up["path"]),
+             "size": os.path.getsize(up["path"])})
+        log.info("upload from client #%d saved: %s", client.id, up["path"])
+
+
+async def serve(cfg: cfgmod.Config) -> int:
+    server = DeskLinkServer(cfg)
+    loop = asyncio.get_running_loop()
+    import signal
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, server.stop)
+    try:
+        return await server.run()
+    except UserCancelled:
+        log.error("portal consent denied or cancelled; exiting")
+        return 2
