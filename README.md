@@ -125,6 +125,25 @@ Unicode keysym path, so the client and host keyboard layouts can differ.
 F11 toggles fullscreen; the ☰ menu has monitors, quality, view-only and
 Disconnect.
 
+## Host monitoring (TUI)
+
+While the host runs, a local control socket (mode 0600, same-user only)
+exposes state to `desklink tui` and to scripts:
+
+```bash
+python3 -m desklink tui            # live dashboard: streams, encoders, clients
+# keys: q quit · k <id> kick a client · i <#> force keyframe
+#       + / - refresh rate · space pause
+```
+
+The dashboard shows each monitor's encode branches (resolution cap,
+bitrate, encoder, live size, subscriber count) and every connected client
+(name, address, quality, bytes sent, frames, drops). Socket path:
+`$XDG_RUNTIME_DIR/desklink.sock` (falls back to `/tmp/desklink-<uid>.sock`);
+one JSON line per request, `{"cmd":"status" | "kick","client":ID |
+"idr","stream":N | "ping"}` — handy for scripts. Disable with
+`python3 -m desklink serve --no-control`.
+
 ## Quality and resolution handling
 
 - Quality is **per client**: pick Low/High in the menu, or let the viewer
@@ -180,6 +199,8 @@ host/desklink/     Python host
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
   displays.py      kscreen-doctor polling for live monitor changes
+  control.py       local unix socket: status / kick / keyframe
+  tui.py           curses dashboard over the control socket
   viewer/          GTK4 desktop viewer (net, decode, app, launcher, hosts)
   testclient.py    reference client (dumps H.264, sends scripted input)
   e2e_multiclient.py  multi-client quality test (needs a running host + PIN)

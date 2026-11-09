@@ -87,6 +87,21 @@ Video frames may be dropped by the server under congestion (oldest first);
 a dropped burst is followed by a forced keyframe. File chunks are never
 dropped; the sender blocks on TCP backpressure.
 
+## Local control socket
+
+Not part of the client protocol. The host listens on a unix stream socket
+(`$XDG_RUNTIME_DIR/desklink.sock`, mode 0600 — same user only; disable with
+`serve --no-control`). One JSON line in, one JSON line out:
+
+| Request | Reply |
+|---|---|
+| `{"cmd":"status"}` | `{"ok":true,"host":…,"uptime_s":…,"streams":[{id,node,logical,branches:[{maxh,kbps,encoder,size,clients}]}],"clients":[{id,name,addr,auth,stream,kbps,maxh,kbps_out,frames,dropped,video_q}]}` |
+| `{"cmd":"kick","client":ID}` | `{"ok":true,"kicked":ID}` — client receives `bye` and is disconnected |
+| `{"cmd":"idr","stream":N}` | `{"ok":true}` — forced keyframe on all branches of stream N |
+| `{"cmd":"ping"}` | `{"ok":true}` |
+
+Consumed by `desklink tui`; usable by any script on the machine.
+
 ## Session recovery
 
 If the host's portal session dies (monitor unplug, compositor restart), the

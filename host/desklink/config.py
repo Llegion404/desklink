@@ -21,6 +21,7 @@ DEFAULTS = {
     "downloads_dir": "~/Downloads/desklink",
     "allow_clipboard": True,
     "allowed_fs_roots": "~",  # comma-separated list of roots the client may browse
+    "control_socket": True,   # local unix socket for `desklink tui` monitoring
     "host_name": "",          # shown to clients; empty = hostname
     # restore token for the portal consent dialog ("remember" support)
     "restore_token": "",
@@ -38,6 +39,7 @@ class Config:
     downloads_dir: str = "~/Downloads/desklink"
     allow_clipboard: bool = True
     allowed_fs_roots: str = "~"
+    control_socket: bool = True
     host_name: str = ""
     restore_token: str = ""
 

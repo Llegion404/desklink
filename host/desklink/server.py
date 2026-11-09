@@ -120,6 +120,7 @@ class Client:
         self.addr = writer.get_extra_info("peername")
         self.sender = Sender(writer)
         self.authenticated = False
+        self.name = ""                      # user-agent from the auth msg
         self.stream: int | None = None      # subscribed stream (node_id)
         self.quality = (server.cfg.bitrate_kbps, 0)  # (kbps, maxh) per client
         self.pkey: tuple | None = None      # pipeline key = (node, maxh, kbps)
@@ -156,6 +157,8 @@ class DeskLinkServer:
         self._restarting = False
         self._aloop: asyncio.AbstractEventLoop | None = None
         self._display_task: asyncio.Task | None = None
+        self._control = None                # ControlServer (desklink tui)
+        self._started = time.monotonic()
 
     # ------------------------------------------------------------ lifecycle
     async def run(self) -> int:
@@ -167,6 +170,10 @@ class DeskLinkServer:
             await self._start_portal_session()
             self._server = await asyncio.start_server(
                 self._handle_client, host="0.0.0.0", port=self.cfg.port)
+            if self.cfg.control_socket:
+                from .control import ControlServer
+                self._control = ControlServer(self)
+                await self._control.start()
             log.info("listening on 0.0.0.0:%d (streams: %s)",
                      self.cfg.port,
                      [f"{s.node_id}:{s.width}x{s.height}" for s in self.session.streams])
@@ -256,6 +263,9 @@ class DeskLinkServer:
 
     async def shutdown(self):
         log.info("shutting down")
+        if self._control:
+            await self._control.stop()
+            self._control = None
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -351,6 +361,85 @@ class DeskLinkServer:
     def stop(self):
         self._stopping.set()
 
+    # ------------------------------------------------- management (control)
+    def snapshot(self) -> dict:
+        """State for `desklink tui` / the control socket. Cheap, read-only;
+        copies what it reads so the caller never sees live containers."""
+        streams = []
+        if self.session:
+            for s in self.session.streams:
+                branches = []
+                cap = self.video._captures.get(s.node_id) if self.video else None
+                if cap is not None:
+                    for key in list(cap._order):
+                        b = cap.branches.get(key, {})
+                        branches.append({
+                            "maxh": key[1], "kbps": key[2],
+                            "encoder": b.get("enc_name", ""),
+                            "size": list(b.get("dims") or (0, 0)),
+                            "clients": self.video._refcounts.get(key, 0),
+                        })
+                streams.append({
+                    "id": self.node_to_idx.get(s.node_id, -1),
+                    "node": s.node_id,
+                    "logical": [s.width, s.height],
+                    "branches": branches,
+                })
+        clients = []
+        for c in list(self.clients):
+            cstream = (self.node_to_idx.get(c.stream, -1)
+                       if c.stream is not None else None)
+            q = len(c.sender.video) if c.sender else 0
+            clients.append({
+                "id": c.id, "name": c.name,
+                "addr": f"{c.addr[0]}:{c.addr[1]}" if c.addr else "?",
+                "auth": c.authenticated, "stream": cstream,
+                "kbps": c.quality[0], "maxh": c.quality[1],
+                "kbps_out": int(c.sender.bytes_out * 8 / 1000)
+                if c.sender else 0,
+                "frames": c.sender.frames_out if c.sender else 0,
+                "dropped": c.sender.dropped if c.sender else 0,
+                "video_q": q,
+            })
+        return {
+            "v": 1,
+            "host": self.cfg.name,
+            "port": self.cfg.port,
+            "uptime_s": int(time.monotonic() - self._started),
+            "pin_set": self.cfg.pin_key is not None,
+            "clipboard": bool(self.clipboard and self.clipboard.enabled),
+            "restarting": self._restarting,
+            "streams": streams,
+            "clients": clients,
+        }
+
+    async def kick(self, client_id: int) -> dict:
+        """Disconnect one client (bye + socket close; the regular disconnect
+        path then releases its input/pipeline refs)."""
+        for c in list(self.clients):
+            if c.id == client_id:
+                log.info("client #%d (%s) kicked via control socket",
+                         c.id, c.name or "?")
+                with contextlib.suppress(Exception):
+                    await c.sender.send_json(
+                        {"type": "bye", "msg": "kicked by host"})
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(c.sender.close(), 2)
+                return {"ok": True, "kicked": client_id}
+        return {"ok": False, "error": f"no client #{client_id}"}
+
+    def force_keyframe(self, stream_idx: int) -> dict:
+        """Force an IDR on every branch of the given stream (control socket
+        and `desklink tui`)."""
+        node = self.idx_to_node.get(stream_idx)
+        cap = self.video._captures.get(node) if (node is not None
+                                                 and self.video) else None
+        if cap is None:
+            return {"ok": False,
+                    "error": f"no capture on stream #{stream_idx}"}
+        self.glib.submit(cap.force_idr, None)   # None = every branch
+        return {"ok": True}
+
     # ------------------------------------------------------------ fan-out
     def _distribute(self, key: tuple, keyframe: bool, pts_us: int, data: bytes):
         if not self.clients:
@@ -441,6 +530,7 @@ class DeskLinkServer:
             log.warning("client #%d failed auth", client.id)
             return False, "bad pin"
         client.authenticated = True
+        client.name = str(msg.get("client", "?"))
         _desktop_notify("DeskLink",
                         f"Client connected from {client.addr[0]} "
                         f"({msg.get('client', '?')})")

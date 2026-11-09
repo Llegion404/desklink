@@ -33,6 +33,8 @@ def cmd_serve(args) -> int:
     if cfg.pin_key is None:
         print("No PIN configured. Run:  python3 -m desklink set-pin", file=sys.stderr)
         return 3
+    if args.no_control:
+        cfg.control_socket = False
     from .server import serve
     return asyncio.run(serve(cfg))
 
@@ -108,6 +110,19 @@ def cmd_view(args) -> int:
     return run(args)
 
 
+def cmd_tui(args) -> int:
+    import os
+    from .control import socket_path
+    path = args.socket or socket_path()
+    if not os.path.exists(path):
+        print(f"No control socket at {path}.\n"
+              f"Is the host running? Start it with: python3 -m desklink serve",
+              file=sys.stderr)
+        return 3
+    from .tui import run
+    return run(interval=args.interval, path=path)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="desklink",
                                      description="DeskLink remote desktop host")
@@ -116,7 +131,16 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("serve", help="run the host server")
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--no-control", action="store_true",
+                   help="disable the local control socket (desklink tui)")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("tui", help="monitor the running host in a terminal")
+    p.add_argument("--socket", help="control socket path "
+                                    "(default: $XDG_RUNTIME_DIR/desklink.sock)")
+    p.add_argument("--interval", type=float, default=1.0,
+                   help="refresh seconds (default 1.0)")
+    p.set_defaults(func=cmd_tui)
 
     p = sub.add_parser("set-pin", help="set/replace the access PIN")
     p.add_argument("--pin", help="read PIN from argument instead of prompt")
