@@ -4,7 +4,8 @@ Usage:
   python3 -m desklink serve                  # run the host
   python3 -m desklink set-pin [--pin ...]    # set the access PIN
   python3 -m desklink status                 # show addresses
-  python3 -m desklink view --host IP --pin X # open a desktop viewer window
+  python3 -m desklink view                   # connect GUI (saved hosts)
+  python3 -m desklink view --host IP --pin X # connect directly to one host
   python3 -m desklink.testclient --help      # built-in test client
 """
 
@@ -90,8 +91,19 @@ def cmd_view(args) -> int:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
         datefmt="%H:%M:%S")
-    if not args.pin:
-        args.pin = getpass.getpass(f"PIN for {args.host}: ")
+    if args.host is None:
+        # no --host: open the connect GUI (saved hosts + PIN entry)
+        if args.pin:
+            parser_warn = ("--pin without --host is ignored; pick a host in "
+                           "the window")
+            print(f"note: {parser_warn}", file=sys.stderr)
+    else:
+        # accept host:port in --host as well as separate --port
+        if ":" in args.host:
+            args.host, _, p = args.host.rpartition(":")
+            args.port = int(p)
+        if not args.pin:
+            args.pin = getpass.getpass(f"PIN for {args.host}: ")
     from .viewer.app import run
     return run(args)
 
@@ -113,8 +125,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("status", help="show config and connection addresses")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("view", help="open a desktop viewer window (client)")
-    p.add_argument("--host", required=True, help="host IP[:port]")
+    p = sub.add_parser("view", help="open the desktop viewer (client)")
+    p.add_argument("--host", help="host IP[:port] — omit for the connect GUI "
+                                  "with saved hosts")
     p.add_argument("--port", type=int, default=9090)
     p.add_argument("--pin", help="access PIN (prompted if omitted)")
     p.add_argument("--fullscreen", action="store_true")

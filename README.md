@@ -39,9 +39,9 @@ session is created.
   sheet with sticky modifiers, hardware-key passthrough, multi-monitor
   picker, two-way clipboard, streamed file transfer (no memory cap),
   auto-reconnect, saved hosts
-- **Desktop viewer (GTK4)**: aspect-correct letterboxed display, monitor
-  picker, quality presets, view-only, fullscreen, two-way clipboard,
-  auto-reconnect
+- **Desktop viewer (GTK4)**: connect GUI with saved hosts, aspect-correct
+  letterboxed display, monitor picker, quality presets, view-only,
+  fullscreen, two-way clipboard, auto-reconnect
 - **Security**: per-connection HMAC-SHA256 challenge over a random salt —
   the PIN never crosses the wire
 - Works over **plain LAN and Tailscale** with zero extra infrastructure
@@ -105,15 +105,25 @@ monitor picker, quality, view-only.
 
 ```bash
 cd desklink/host
-python3 -m desklink view --host 192.168.1.20 --pin 1234
+python3 -m desklink view                    # connect GUI — saved hosts + PIN
+python3 -m desklink view --host 192.168.1.20 --pin 1234   # direct connect
 # --port --fullscreen --view-only --no-auto-fit
 ```
 
-The viewer letterboxes the stream to any window shape and, by default
-(**auto-fit**), asks the host to downscale to the window's device size —
-a 1080p laptop watching a 4K host decodes ~2 Mpixel frames instead of 8.
-Pointer, wheel and keyboard are injected; printable keys go through a
+The **connect GUI** keeps a saved-host list (add with `+`, connect with
+Enter or double-click, `Ctrl+N`, `Delete`, optional *Save PIN* per host,
+Disconnect returns to the list). Hosts live in
+`~/.config/desklink/hosts.json` (mode 0600); a saved PIN is stored in
+**plaintext** in that file — tick *Save PIN* only on machines where that's
+acceptable.
+
+The session window letterboxes the stream to any window shape and, by
+default (**auto-fit**), asks the host to downscale to the window's device
+size — a 1080p laptop watching a 4K host decodes ~2 Mpixel frames instead
+of 8. Pointer, wheel and keyboard are injected; printable keys go through a
 Unicode keysym path, so the client and host keyboard layouts can differ.
+F11 toggles fullscreen; the ☰ menu has monitors, quality, view-only and
+Disconnect.
 
 ## Quality and resolution handling
 
@@ -170,7 +180,7 @@ host/desklink/     Python host
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
   displays.py      kscreen-doctor polling for live monitor changes
-  viewer/          GTK4 desktop viewer (net, decode, app)
+  viewer/          GTK4 desktop viewer (net, decode, app, launcher, hosts)
   testclient.py    reference client (dumps H.264, sends scripted input)
   e2e_multiclient.py  multi-client quality test (needs a running host + PIN)
 android/app/       Kotlin/Compose client (MediaCodec decode, Compose UI)

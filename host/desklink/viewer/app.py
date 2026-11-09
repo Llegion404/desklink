@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from types import SimpleNamespace
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -21,6 +22,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk
 
 from .decode import VideoDecoder
+from .launcher import LauncherWindow
 from .net import (ViewerClient, EvClip, EvClosed, EvError, EvHello,
                   EvPong, EvQuality, EvStreamInfo, EvSubscribed)
 
@@ -46,12 +48,47 @@ class ViewerApplication(Gtk.Application):
     def __init__(self, args):
         super().__init__(application_id="com.desklink.viewer")
         self.args = args
+        # launcher mode when no --host was given: the launcher is the home
+        # screen, sessions open from it and return to it
+        self.launcher_mode = args.host is None
+        self.launcher: LauncherWindow | None = None
         self.win: ViewerWindow | None = None
 
     def do_activate(self):
-        if self.win is None:
-            self.win = ViewerWindow(self, self.args)
-            self.win.present()
+        if self.launcher_mode:
+            if self.launcher is None:
+                self.launcher = LauncherWindow(self)
+            self.launcher.present()
+        else:
+            self.open_session(self.args.host, self.args.port, self.args.pin)
+
+    def open_session(self, host: str, port: int, pin: str):
+        """Open a session window for (host, port); hides the launcher while
+        it is up. CLI direct mode just opens the window."""
+        opts = SimpleNamespace(host=host, port=port, pin=pin,
+                               fullscreen=getattr(self.args, "fullscreen",
+                                                  False),
+                               view_only=getattr(self.args, "view_only",
+                                                 False),
+                               no_auto_fit=getattr(self.args, "no_auto_fit",
+                                                   False))
+        if self.launcher is not None:
+            self.launcher.set_visible(False)
+        if self.win is not None:
+            # defensive: a session is already up — replace it
+            self.win.on_closed_cb = None
+            self.win.close()
+        self.win = ViewerWindow(self, opts)
+        self.win.on_closed_cb = self.session_closed
+        self.win.present()
+
+    def session_closed(self, reason: str | None):
+        """Session window closed — back to the launcher in GUI mode."""
+        self.win = None
+        if self.launcher_mode and self.launcher is not None:
+            self.launcher.set_visible(True)
+            self.launcher.present()
+            self.launcher.session_returned(reason)
 
 
 class ViewerWindow(Gtk.ApplicationWindow):
@@ -61,6 +98,10 @@ class ViewerWindow(Gtk.ApplicationWindow):
         self._pin = args.pin
         self.client: ViewerClient | None = None
         self.decoder: VideoDecoder | None = None
+        # called with the final disconnect reason when this window closes
+        # (launcher mode uses it to show the error on the home screen)
+        self.on_closed_cb = None
+        self._last_error: str | None = None
 
         # session state
         self.host_name = args.host
@@ -202,12 +243,23 @@ class ViewerWindow(Gtk.ApplicationWindow):
                                    lambda *_: self._close_menu_and(self._start_client))
         box.append(self.reconnect_btn)
 
+        sep()
+        leave = Gtk.Button(
+            label="Disconnect" if self._in_launcher_mode() else "Close window")
+        leave.add_css_class("destructive-action")
+        leave.connect("clicked", lambda *_: self._close_menu_and(self.close))
+        box.append(leave)
+
         popover = Gtk.Popover()
         popover.set_child(box)
         self._menu_popover = popover
         return popover
 
     # ---------------------------------------------------------- controllers
+    def _in_launcher_mode(self) -> bool:
+        app = self.get_application()
+        return bool(app is not None and getattr(app, "launcher_mode", False))
+
     def _install_controllers(self):
         box = self.video
 
@@ -256,6 +308,11 @@ class ViewerWindow(Gtk.ApplicationWindow):
             self.client.close("window closed")
         if self.decoder:
             self.decoder.stop()
+        # return to the launcher BEFORE destroying this window so the app
+        # never drops to zero windows mid-transition (that exits Gtk)
+        if self.on_closed_cb is not None:
+            cb, self.on_closed_cb = self.on_closed_cb, None
+            cb(self._last_error)
         self.destroy()
         return True
 
@@ -507,12 +564,14 @@ class ViewerWindow(Gtk.ApplicationWindow):
                 provider = Gdk.ContentProvider.new_for_value(evt.text)
                 Gdk.Display.get_default().get_clipboard().set_content(provider)
         elif kind is EvError:
+            self._last_error = evt.msg
             self._set_status(evt.msg)
         elif kind is EvClosed:
             self.connected = False
             self._scroll_acc_x = self._scroll_acc_y = 0.0
             self.reconnect_btn.set_visible(not evt.will_retry)
             if not evt.will_retry:
+                self._last_error = evt.reason
                 self._set_status(evt.reason)
         self._update_subtitle()
 
