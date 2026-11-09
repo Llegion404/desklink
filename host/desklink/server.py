@@ -260,6 +260,9 @@ class DeskLinkServer:
             self.session = None
         self.node_to_idx = {}
         self.idx_to_node = {}
+        # node ids change across sessions — stale entries would only mislead
+        self._encoded.clear()
+        self._idr_last.clear()
 
     async def shutdown(self):
         log.info("shutting down")

@@ -24,6 +24,7 @@ from .control import socket_path
 
 MIN_INTERVAL = 0.5
 MAX_INTERVAL = 5.0
+MESSAGE_TTL = 6.0            # action feedback ("kicked 3") auto-expires
 
 
 class HostConnection:
@@ -174,11 +175,16 @@ def render(scr, snap: dict | None, error: str | None, state: dict):
     line(f" [q]uit  [k <id>] kick  [i <#>] keyframe  [+/-] rate  "
          f"[space] pause   ({mode})", curses.A_DIM)
 
-    if state["message"]:
+    if state["message"] and time.monotonic() < state["message_until"]:
         line(f" {state['message']}", curses.color_pair(2))
     if error:
         line(f" {error}", curses.color_pair(3))
     scr.refresh()
+
+
+def _say(state: dict, msg: str):
+    state["message"] = msg
+    state["message_until"] = time.monotonic() + MESSAGE_TTL
 
 
 def _prompt(scr, label: str) -> str:
@@ -205,7 +211,9 @@ def _prompt(scr, label: str) -> str:
 
 def run(interval: float = 1.0, path=None) -> int:
     conn = HostConnection(path or socket_path())
-    state = {"interval": interval, "paused": False, "message": ""}
+    interval = min(MAX_INTERVAL, max(MIN_INTERVAL, interval))
+    state = {"interval": interval, "paused": False, "message": "",
+             "message_until": 0.0}
     snap: dict | None = None
     error: str | None = None
     last_poll = 0.0
@@ -258,23 +266,26 @@ def run(interval: float = 1.0, path=None) -> int:
                 state["message"] = ""
             elif key == ord("k"):
                 raw = _prompt(scr, "kick client id")
-                if raw.isdigit():
+                if not raw.isdigit():
+                    _say(state, f"cancelled — '{raw}' is not a client id"
+                         if raw else "cancelled")
+                else:
                     reply = conn.request({"cmd": "kick",
                                           "client": int(raw)})
-                    state["message"] = ("kicked " + raw
-                                        if reply.get("ok")
-                                        else f"kick failed: "
-                                             f"{reply.get('error')}")
+                    _say(state, "kicked " + raw if reply.get("ok")
+                         else f"kick failed: {reply.get('error')}")
                     poll(force=True)
             elif key == ord("i"):
                 raw = _prompt(scr, "keyframe stream #")
-                if raw.isdigit():
+                if not raw.isdigit():
+                    _say(state, f"cancelled — '{raw}' is not a stream number"
+                         if raw else "cancelled")
+                else:
                     reply = conn.request({"cmd": "idr",
                                           "stream": int(raw)})
-                    state["message"] = ("keyframe sent to #" + raw
-                                        if reply.get("ok")
-                                        else f"keyframe failed: "
-                                             f"{reply.get('error')}")
+                    _say(state, "keyframe sent to #" + raw
+                         if reply.get("ok")
+                         else f"keyframe failed: {reply.get('error')}")
             elif key in (curses.KEY_RESIZE, -1):
                 pass                              # repaint next tick
 

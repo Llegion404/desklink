@@ -78,7 +78,18 @@ class ViewerApplication(Gtk.Application):
             # defensive: a session is already up — replace it
             self.win.on_closed_cb = None
             self.win.close()
-        self.win = ViewerWindow(self, opts)
+        try:
+            self.win = ViewerWindow(self, opts)
+        except Exception:
+            log.exception("session window failed to open for %s:%d",
+                          host, port)
+            self.win = None
+            if self.launcher is not None:
+                self.launcher.set_visible(True)
+                self.launcher.present()
+                self.launcher.session_returned(f"could not open viewer "
+                                               f"for {host}:{port}")
+            return
         self.win.on_closed_cb = self.session_closed
         self.win.present()
 

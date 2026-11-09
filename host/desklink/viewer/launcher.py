@@ -16,7 +16,8 @@ import time
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 from .hosts import HostStore, parse_address
 
@@ -159,7 +160,7 @@ class LauncherWindow(Gtk.ApplicationWindow):
 
         self._status = Gtk.Label(label="", halign=Gtk.Align.START, xalign=0)
         self._status.add_css_class("dim-label")
-        self._status.set_ellipsize(3)          # Pango.EllipsizeMode.END
+        self._status.set_ellipsize(Pango.EllipsizeMode.END)
         root.append(self._status)
 
         self.set_child(root)
