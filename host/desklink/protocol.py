@@ -70,8 +70,14 @@ FT_JSON = 0x01
 FT_VIDEO = 0x02
 FT_CLIPBOARD = 0x03
 FT_FILE = 0x04
+FT_AUDIO = 0x05
 
 FLAG_KEYFRAME = 0x01
+
+# audio payload kinds (frame 0x05, payload = [1B kind][data])
+AUDIO_OPUS = 0        # one raw Opus packet
+AUDIO_OPUS_HEAD = 1   # OpusHead (MediaCodec csd-0 for the raw format)
+AUDIO_OGG = 2         # an Ogg page (self-describing: oggdemux handles headers)
 
 MAX_FRAME = 16 * 1024 * 1024  # hard cap on any single frame payload
 
@@ -96,6 +102,14 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, int, bytes]:
 
 def file_payload(file_id: int, data: bytes) -> bytes:
     return struct.pack(">I", file_id) + data
+
+
+def audio_payload(kind: int, data: bytes) -> bytes:
+    return bytes([kind]) + data
+
+
+def parse_audio_payload(payload: bytes) -> tuple[int, bytes]:
+    return payload[0], payload[1:]
 
 
 def parse_file_payload(payload: bytes) -> tuple[int, bytes]:

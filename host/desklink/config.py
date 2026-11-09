@@ -22,6 +22,8 @@ DEFAULTS = {
     "allow_clipboard": True,
     "allowed_fs_roots": "~",  # comma-separated list of roots the client may browse
     "control_socket": True,   # local unix socket for `desklink tui` monitoring
+    "lock_on_disconnect": False,  # lock the session when the last client leaves
+    "adaptive_bitrate": True,  # auto-lower encoder bitrate when clients drop frames
     "host_name": "",          # shown to clients; empty = hostname
     # restore token for the portal consent dialog ("remember" support)
     "restore_token": "",
@@ -40,6 +42,8 @@ class Config:
     allow_clipboard: bool = True
     allowed_fs_roots: str = "~"
     control_socket: bool = True
+    lock_on_disconnect: bool = False
+    adaptive_bitrate: bool = True
     host_name: str = ""
     restore_token: str = ""
 

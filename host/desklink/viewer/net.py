@@ -42,6 +42,7 @@ class StreamDesc:
 class EvHello:
     host: str
     clipboard: bool
+    audio: bool
     streams: list[StreamDesc]
 
 
@@ -89,12 +90,13 @@ class ViewerClient:
     """One client per viewer session; survives reconnects internally."""
 
     def __init__(self, host: str, port: int, pin: str,
-                 on_event, on_frame):
+                 on_event, on_frame, on_audio=None):
         self.host = host
         self.port = port
         self.pin = pin
         self.on_event = on_event        # (event) -> None, on GTK thread
         self.on_frame = on_frame        # (stream, keyframe, pts_us, b) reader thread
+        self.on_audio = on_audio        # (kind, data) reader thread
         self.aloop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -166,6 +168,7 @@ class ViewerClient:
         self._reconnects = 0    # a healthy session resets the backoff
         self._emit(EvHello(msg.get("host", "?"),
                            bool(msg.get("clipboard")),
+                           bool(msg.get("audio")),
                            _parse_streams(msg)))
         await self._read_loop()
 
@@ -179,6 +182,10 @@ class ViewerClient:
                 stream, flags, pts, data = proto.parse_video_payload(payload)
                 self.on_frame(stream, bool(flags & proto.FLAG_KEYFRAME),
                               pts, data)
+            elif ftype == proto.FT_AUDIO:
+                if self.on_audio is not None:
+                    kind, data = proto.parse_audio_payload(payload)
+                    self.on_audio(kind, data)
             elif ftype == proto.FT_JSON:
                 msg = json.loads(payload)
                 for evt in _json_event(msg):
@@ -217,6 +224,9 @@ class ViewerClient:
 
     def request_idr(self, stream: int):
         self.send_json({"type": "request-idr", "stream": stream})
+
+    def set_audio(self, on: bool, fmt: str):
+        self.send_json({"type": "set-audio", "on": on, "format": fmt})
 
     def ping(self):
         self.send_json({"type": "ping", "t": proto.now_ms()})
@@ -279,7 +289,7 @@ def _json_event(msg: dict):
     if mtype == "hello":
         # session was re-requested host-side: re-announce + resubscribe
         return [EvHello(msg.get("host", "?"), bool(msg.get("clipboard")),
-                        _parse_streams(msg))]
+                        bool(msg.get("audio")), _parse_streams(msg))]
     if mtype == "subscribed":
         return [EvSubscribed(int(msg.get("stream", -1)))]
     if mtype == "stream-info":

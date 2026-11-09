@@ -19,12 +19,14 @@ from types import SimpleNamespace
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk
+gi.require_version("Gst", "1.0")
+from gi.repository import Gdk, GLib, Gst, Gtk
 
 from .decode import VideoDecoder
 from .launcher import LauncherWindow
 from .net import (ViewerClient, EvClip, EvClosed, EvError, EvHello,
                   EvPong, EvQuality, EvStreamInfo, EvSubscribed)
+from .. import protocol as proto
 
 log = logging.getLogger("desklink.viewer.app")
 
@@ -36,6 +38,41 @@ QUALITY_PRESETS = [                       # (kbps, label) — maxh is auto-fit's
 ]
 SCROLL_STEP_PX = 80.0
 FIT_DEBOUNCE_MS = 300
+
+
+class AudioPlayback:
+    """Desktop audio: Ogg-Opus pages from the wire -> oggdemux -> opusdec ->
+    pulsesink. push() is called on the net reader thread (appsrc is
+    thread-safe, same as the video hot path); start/stop on the GTK thread."""
+
+    def __init__(self):
+        self.pipeline = None
+        self.src = None
+
+    def start(self):
+        if self.pipeline:
+            return
+        try:
+            self.pipeline = Gst.parse_launch(
+                "appsrc name=src is-live=true do-timestamp=true format=time "
+                "! oggdemux ! opusdec ! audioconvert ! audioresample ! "
+                "pipewiresink")
+            self.src = self.pipeline.get_by_name("src")
+            self.pipeline.set_state(Gst.State.PLAYING)
+        except Exception:
+            log.exception("audio pipeline failed to start")
+            self.pipeline = None
+            self.src = None
+
+    def push(self, data: bytes):
+        if self.src is not None:
+            self.src.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+
+    def stop(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+            self.src = None
 
 
 def run(args) -> int:
@@ -129,6 +166,11 @@ class ViewerWindow(Gtk.ApplicationWindow):
         self.kbps = 8000
         self.maxh_sent: int | None = None
         self.auto_fit = not args.no_auto_fit
+
+        # audio (host capability arrives in hello; on = user preference)
+        self.audio_ok = False
+        self.audio_on = True
+        self.audio_pb = AudioPlayback()
 
         # view state
         self.view_only = bool(args.view_only)
@@ -238,6 +280,10 @@ class ViewerWindow(Gtk.ApplicationWindow):
         self.autofit_btn.connect("toggled", self._on_autofit)
         box.append(self.autofit_btn)
 
+        self.audio_btn = Gtk.CheckButton(label="Audio", active=self.audio_on)
+        self.audio_btn.connect("toggled", self._on_audio_toggle)
+        box.append(self.audio_btn)
+
         sep()
         self.viewonly_btn = Gtk.CheckButton(label="View only",
                                             active=self.view_only)
@@ -248,6 +294,12 @@ class ViewerWindow(Gtk.ApplicationWindow):
         fullscreen_btn.connect("clicked",
                                lambda *_: self._close_menu_and(self._toggle_fullscreen))
         box.append(fullscreen_btn)
+
+        shot_btn = Gtk.Button(label="Save screenshot")
+        shot_btn.set_tooltip_text("Save the current frame to ~/Pictures")
+        shot_btn.connect("clicked",
+                         lambda *_: self._close_menu_and(self._save_screenshot))
+        box.append(shot_btn)
 
         self.reconnect_btn = Gtk.Button(label="Reconnect", visible=False)
         self.reconnect_btn.connect("clicked",
@@ -311,7 +363,8 @@ class ViewerWindow(Gtk.ApplicationWindow):
             return
         self.client = ViewerClient(self.args.host, self.args.port, self._pin,
                                    on_event=self._on_event,
-                                   on_frame=self._on_net_frame)
+                                   on_frame=self._on_net_frame,
+                                   on_audio=self._on_net_audio)
         self.client.start_in_thread()
 
     def _on_close(self, *_):
@@ -319,6 +372,7 @@ class ViewerWindow(Gtk.ApplicationWindow):
             self.client.close("window closed")
         if self.decoder:
             self.decoder.stop()
+        self.audio_pb.stop()
         # return to the launcher BEFORE destroying this window so the app
         # never drops to zero windows mid-transition (that exits Gtk)
         if self.on_closed_cb is not None:
@@ -453,6 +507,27 @@ class ViewerWindow(Gtk.ApplicationWindow):
         self.video.get_parent().set_cursor(
             None if self.view_only else Gdk.Cursor.new_from_name("none"))
 
+    def _on_audio_toggle(self, btn):
+        self.audio_on = btn.get_active()
+        self._apply_audio_state()
+
+    def _apply_audio_state(self):
+        """Sync the user's audio preference with the (new) connection —
+        audio subscriptions are per-connection, so every hello re-applies."""
+        if not self.audio_on or not self.audio_ok:
+            self.audio_pb.stop()
+            if self.client and self.connected:
+                self.client.set_audio(False, "ogg")
+            return
+        self.audio_pb.start()
+        if self.client and self.connected:
+            self.client.set_audio(True, "ogg")
+
+    def _on_net_audio(self, kind, data):
+        # reader thread — Ogg pages straight into the decoder's appsrc
+        if kind == proto.AUDIO_OGG and self.audio_on and self.audio_ok:
+            self.audio_pb.push(data)
+
     def _close_menu_and(self, fn):
         if getattr(self, "_menu_popover", None):
             self._menu_popover.popdown()
@@ -522,9 +597,27 @@ class ViewerWindow(Gtk.ApplicationWindow):
                 w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
                 GLib.Bytes.new(data), stride)
             self.video.set_paintable(texture)
+            self._last_texture = texture   # for Save screenshot
         except Exception:
             log.exception("frame show failed", exc_info=True)
         return False                    # remove idle source
+
+    def _save_screenshot(self):
+        texture = getattr(self, "_last_texture", None)
+        if texture is None:
+            self._set_status("no frame to save yet")
+            return
+        from pathlib import Path
+        import time as _t
+        pics = Path.home() / "Pictures"
+        pics.mkdir(exist_ok=True)
+        path = pics / f"desklink-{_t.strftime('%Y%m%d-%H%M%S')}.png"
+        try:
+            texture.save_to_png(str(path))      # Gdk.Texture, GTK >= 4.6
+            self._set_status(f"screenshot saved: {path.name}")
+        except Exception:
+            log.exception("screenshot save failed")
+            self._set_status("screenshot failed")
 
     # -------------------------------------------------------------- events
     def _on_event(self, evt):
@@ -540,6 +633,7 @@ class ViewerWindow(Gtk.ApplicationWindow):
             self.connected = True
             self.host_name = evt.host
             self.clipboard_ok = evt.clipboard
+            self.audio_ok = evt.audio
             self.streams = evt.streams
             self._rebuild_stream_picker()
             target = (self.current_stream if any(
@@ -554,6 +648,7 @@ class ViewerWindow(Gtk.ApplicationWindow):
                 self.client.subscribe(target)
             self._set_status("connected")
             self._wire_clipboard()
+            self._apply_audio_state()   # per-connection: re-subscribe audio
         elif kind is EvSubscribed:
             self.current_stream = evt.stream
             # no decoder flush here: sending flush events through an appsrc

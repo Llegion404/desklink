@@ -24,10 +24,16 @@ session is created.
 
 - **30 fps H.264 streaming** with hardware encode (NVENC) and automatic
   x264 fallback; per-frame backpressure with forced keyframes on drops
+- **Desktop audio** — the host's monitor audio streams as Opus to every
+  client (toggleable per client; raw Opus on Android via MediaCodec, Ogg
+  Opus in the desktop viewer)
 - **Per-client quality** — every client picks its own bitrate and resolution
   cap (`set-quality`); the host keeps **one capture per monitor** and builds
   one encode branch per distinct (resolution-cap, bitrate) pair off it, so a
   phone at 2 Mbps doesn't disturb a viewer at native 4K
+- **Adaptive bitrate** — when a subscriber drops frames, the host lowers
+  that branch's encoder bitrate live (and recovers it after 30 clean
+  seconds); on by default (`adaptive_bitrate` in `~/.config/desklink/config.toml`)
 - **Resolution auto-fit** (desktop viewer) — the stream is downscaled to the
   window's device size, so a 1080p laptop can watch a 4K host cheaply
 - **Live display changes** — monitor resolution changes are detected and
@@ -38,10 +44,12 @@ session is created.
 - **Android**: pinch-zoom that actually zooms, two-finger scroll, keyboard
   sheet with sticky modifiers, hardware-key passthrough, multi-monitor
   picker, two-way clipboard, streamed file transfer (no memory cap),
-  auto-reconnect, saved hosts
+  screenshot to Pictures/DeskLink, auto-reconnect, saved hosts
 - **Desktop viewer (GTK4)**: connect GUI with saved hosts, aspect-correct
   letterboxed display, monitor picker, quality presets, view-only,
-  fullscreen, two-way clipboard, auto-reconnect
+  fullscreen, screenshot, two-way clipboard, auto-reconnect
+- **Privacy**: optional `lock_on_disconnect` — the session locks
+  (`loginctl lock-session`) when the last client leaves
 - **Security**: per-connection HMAC-SHA256 challenge over a random salt —
   the PIN never crosses the wire
 - Works over **plain LAN and Tailscale** with zero extra infrastructure
@@ -152,6 +160,15 @@ one JSON line per request, `{"cmd":"status" | "kick","client":ID |
   (resolution-cap, bitrate) pair off it via a `tee`; clients with the same
   settings share a branch, a quality change rebuilds the capture (brief
   keyframe gap)
+- **Adaptive bitrate** tweaks each branch's encoder bitrate live: >2 % of
+  frames dropped in a 5 s window → bitrate × 0.7 (floor 500 kbps); 30 s
+  clean → ×1.25 back toward the configured value. Disable with
+  `adaptive_bitrate = false` in config.toml
+- **Audio**: the host encodes its default monitor with Opus (96 kbps
+  stereo, 20 ms frames); each client subscribes separately (`set-audio`)
+  and picks its framing — raw Opus packets with a synthesized OpusHead
+  (MediaCodec csd-0) for Android, self-describing Ogg pages for the viewer.
+  Toggle it in the ☰ menu on both clients
 - Under congestion the host drops the oldest frames and forces a keyframe
 - Monitor resolution changes are picked up live (the stream rebuilds and
   clients receive the new encoded size); a monitor unplug restarts the
@@ -196,6 +213,7 @@ PIN authentication directly to the internet — Tailscale is recommended.
 host/desklink/     Python host
   portal.py        RemoteDesktop + ScreenCast + Clipboard portal dance
   video.py         per-client GStreamer pipelines, encoder fallback, NVENC slot
+  audio.py         desktop monitor -> Opus, raw + Ogg framings
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
   displays.py      kscreen-doctor polling for live monitor changes
@@ -211,12 +229,12 @@ host/contrib/      systemd user service + autostart desktop file (optional)
 
 ## Limitations / roadmap
 
-- No audio
 - One NVENC encode per process (others fall back to x264)
 - KDE-centric host (portal + kscreen-doctor); GNOME/Wayland would need a
   display-size backend swap
-- Roadmap ideas: per-session file-transfer UI in the desktop viewer, saved
-  hosts in the viewer, audio
+- Privacy mode (blacking out the physical monitor) is not possible on
+  Plasma Wayland; `lock_on_disconnect` is the closest equivalent
+- Roadmap ideas: session recording, in-session chat, HEVC encode option
 
 ## License
 

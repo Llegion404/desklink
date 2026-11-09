@@ -17,6 +17,7 @@ Every message after the connection is established:
 | 0x02 | video     | `[1B stream_id][1B flags][8B BE pts_us][H.264 Annex-B access unit]` |
 | 0x03 | clipboard | reserved (sent as 0x01 JSON today) |
 | 0x04 | file chunk| `[4B BE file_id][raw bytes]` |
+| 0x05 | audio     | `[1B kind][data]` — kind 0 = one raw Opus packet; kind 1 = OpusHead (MediaCodec csd-0, sent once before raw packets); kind 2 = an Ogg page (self-describing, for GStreamer oggdemux) |
 
 Video flags: bit0 = keyframe (access unit contains an IDR/SPS). SPS/PPS are
 present in-band before every IDR (encoder `config-interval=-1`), so a client
@@ -28,6 +29,7 @@ can start decoding at any keyframe.
 server -> {"type":"greet","v":1,"salt":"<32 hex>","name":"<hostname>"}
 client -> {"type":"auth","mac":"<hex>","client":"<user-agent>"}
 server -> {"type":"hello","v":1,"host":"<name>","clipboard":bool,
+           "audio":bool,
            "streams":[{"id":<node_id>,"w":W,"h":H,"x":X,"y":Y}, ...]}
      or  {"type":"deny","msg":"..."}   (connection then closes)
 ```
@@ -46,6 +48,7 @@ reported by the portal; the video itself may be higher resolution.
 | `unsubscribe` | | stop receiving video |
 | `request-idr` | `stream` | force a keyframe (after lag/switch) |
 | `set-quality` | `kbps, maxh` | **per-client** quality: this client's pipelines use these settings (bitrate 500–50000; `maxh` 0 = native). Other clients are unaffected. Clients with identical settings share one encode. |
+| `set-audio` | `on, format` | subscribe/unsubscribe desktop audio; `format` = `"raw"` (Opus packets + OpusHead preface, kind 1 then 0) or `"ogg"` (Ogg pages, kind 2). Default `raw` when the field is absent. Server replies `audio {on, format, ok}`. |
 | `motion` | `stream, x, y` | absolute pointer, x/y normalized 0..1 in stream space |
 | `button` | `btn: left\|right\|middle, down: bool` | pointer button |
 | `scroll` | `dx, dy` | discrete wheel steps |
@@ -61,7 +64,8 @@ reported by the portal; the video itself may be higher resolution.
 
 ## Server → client JSON
 
-`hello`, `deny`, `pong` (echoes `t`), `clip` (`text`),
+`hello`, `deny`, `pong` (echoes `t`), `clip` (`text`), `audio` (`on`,
+`format`, `ok`) — the reply to `set-audio`,
 `quality` (`kbps, maxh, ok`) in reply to `set-quality`, echoing the
 client's own settings,
 `stream-info` (`stream, w, h` — the actual encoded resolution of the

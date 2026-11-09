@@ -19,6 +19,7 @@ from collections import deque
 from . import config as cfgmod
 from . import displays
 from . import protocol as proto
+from .audio import AudioManager, OPUS_HEAD, available as audio_available
 from .clipboard import ClipboardBridge
 from .files import FileManager, SandboxViolation
 from .glibloop import GLibRunner
@@ -121,6 +122,8 @@ class Client:
         self.sender = Sender(writer)
         self.authenticated = False
         self.name = ""                      # user-agent from the auth msg
+        self.audio: tuple[bool, str] | None = None   # (on, "raw"|"ogg")
+        self.audio_hdr_sent = False           # got the replayed Ogg headers
         self.stream: int | None = None      # subscribed stream (node_id)
         self.quality = (server.cfg.bitrate_kbps, 0)  # (kbps, maxh) per client
         self.pkey: tuple | None = None      # pipeline key = (node, maxh, kbps)
@@ -158,6 +161,10 @@ class DeskLinkServer:
         self._aloop: asyncio.AbstractEventLoop | None = None
         self._display_task: asyncio.Task | None = None
         self._control = None                # ControlServer (desklink tui)
+        self.audio_mgr: AudioManager | None = None
+        self._audio_ogg_hdrs: list[bytes] = []   # captured Ogg header pages
+        self._adapt: dict[tuple, dict] = {}  # branch key -> adapt state
+        self._adapt_task: asyncio.Task | None = None
         self._started = time.monotonic()
 
     # ------------------------------------------------------------ lifecycle
@@ -218,6 +225,18 @@ class DeskLinkServer:
                 on_text=lambda text: aloop.call_soon_threadsafe(
                     self._broadcast_clipboard, text))
 
+        # desktop audio is independent of the portal session but rebuilt
+        # with it for one consistent lifecycle
+        self.audio_mgr = None
+        if audio_available():
+            mgr = AudioManager(self.glib)
+            mgr.on_raw = lambda data: aloop.call_soon_threadsafe(
+                self._distribute_audio, proto.AUDIO_OPUS, data)
+            mgr.on_ogg = lambda data: aloop.call_soon_threadsafe(
+                self._distribute_audio, proto.AUDIO_OGG, data)
+            self.glib.submit(mgr.start)
+            self.audio_mgr = mgr
+
         # clients that survived a session restart re-announce + resubscribe
         hello = self._hello_msg()
         for client in list(self.clients):
@@ -229,16 +248,65 @@ class DeskLinkServer:
                 self._display_task.cancel()
             self._display_task = asyncio.ensure_future(self._poll_display_sizes())
 
+        if self.cfg.adaptive_bitrate:
+            self.video.on_branch_reset = lambda key: \
+                aloop.call_soon_threadsafe(self._adapt.pop, key, None)
+            if self._adapt_task:
+                self._adapt_task.cancel()
+            self._adapt_task = asyncio.ensure_future(self._adapt_loop())
+
     def _hello_msg(self) -> dict:
         return {
             "type": "hello",
             "v": proto.PROTO_VERSION,
             "host": self.cfg.name,
             "clipboard": bool(self.clipboard and self.clipboard.enabled),
+            "audio": self.audio_mgr is not None,
             "streams": [{"id": self.node_to_idx[s.node_id],
                          "w": s.width, "h": s.height,
                          "x": s.x, "y": s.y} for s in self.session.streams],
         }
+
+    def _distribute_audio(self, kind: int, data: bytes):
+        """Fan desktop audio out to clients that enabled it; each client gets
+        exactly its chosen framing (raw Opus packets or Ogg pages).
+
+        Ogg pages with granulepos 0 are the stream header pages (BOS +
+        OpusTags) — oggmux emitted them once at pipeline start, so they must
+        be captured and replayed to every Ogg client BEFORE its live pages,
+        or oggdemux never builds the chain."""
+        if kind == proto.AUDIO_OGG:
+            granule = int.from_bytes(data[6:14], "little", signed=True)
+            if granule == 0:
+                if (len(self._audio_ogg_hdrs) < 4
+                        and data not in self._audio_ogg_hdrs):
+                    self._audio_ogg_hdrs.append(data)
+                return                     # headers are per-client, not live
+        payload = proto.frame(proto.FT_AUDIO, proto.audio_payload(kind, data))
+        for client in list(self.clients):
+            if not client.authenticated or client.audio is None:
+                continue
+            on, fmt = client.audio
+            if not on:
+                continue
+            if (kind == proto.AUDIO_OGG) != (fmt == "ogg"):
+                continue
+            if fmt == "ogg" and not client.audio_hdr_sent:
+                if not self._audio_ogg_hdrs:
+                    continue               # headers not seen yet — hold pages
+                for h in self._audio_ogg_hdrs:
+                    asyncio.ensure_future(client.sender.put_data(proto.frame(
+                        proto.FT_AUDIO,
+                        proto.audio_payload(proto.AUDIO_OGG, h))))
+                client.audio_hdr_sent = True
+            asyncio.ensure_future(client.sender.put_data(payload))
+
+    async def _send_audio_config(self, client: Client):
+        """OpusHead preface for raw-format clients (MediaCodec csd-0)."""
+        payload = proto.frame(
+            proto.FT_AUDIO,
+            proto.audio_payload(proto.AUDIO_OPUS_HEAD, OPUS_HEAD))
+        await client.sender.put_data(payload)
 
     def _teardown_session_objects(self):
         """Tear down everything bound to the current portal session (safe to
@@ -246,6 +314,10 @@ class DeskLinkServer:
         if self._display_task:
             self._display_task.cancel()
             self._display_task = None
+        if self._adapt_task:
+            self._adapt_task.cancel()
+            self._adapt_task = None
+        self._adapt.clear()
         if self.input:
             self.input.release_all()
             self.input = None
@@ -255,6 +327,10 @@ class DeskLinkServer:
         if self.clipboard:
             self.clipboard.close()
             self.clipboard = None
+        if self.audio_mgr:
+            self.glib.submit(self.audio_mgr.stop)
+            self.audio_mgr = None
+        self._audio_ogg_hdrs.clear()
         if self.session:
             self.session.close()
             self.session = None
@@ -342,6 +418,44 @@ class DeskLinkServer:
                             s.width, s.height = size
             await asyncio.sleep(3.0)
 
+    async def _adapt_loop(self):
+        """Per-branch adaptive bitrate: drops mean some subscriber's link
+        can't keep up with the branch's encode, so lower its live bitrate;
+        long clean periods claw it back toward the configured value. The
+        branch KEY (and thus sharing) is untouched — only the encoder's
+        setpoint moves."""
+        win_s = 5.0
+        await asyncio.sleep(4)
+        while not self._stopping.is_set():
+            await asyncio.sleep(win_s)
+            if not self.video or self._restarting:
+                self._adapt.clear()
+                continue
+            for key, st in list(self._adapt.items()):
+                frames, drops = st["frames"], st["drops"]
+                st["frames"] = st["drops"] = 0
+                base = key[2]
+                if frames < 30:          # too quiet to judge this window
+                    continue
+                rate = drops / frames
+                if rate > 0.02 and st["kbps"] > 500:
+                    st["kbps"] = max(500, int(st["kbps"] * 0.7))
+                    st["idle"] = 0.0
+                    log.info("adaptive: branch %r -> %d kbps "
+                             "(%.0f%% frames dropped)", (key[1], key[2]),
+                             st["kbps"], rate * 100)
+                    self.video.set_branch_bitrate(key, st["kbps"])
+                elif rate == 0:
+                    st["idle"] += win_s
+                    if st["idle"] >= 30 and st["kbps"] < base:
+                        st["kbps"] = min(base, int(st["kbps"] * 1.25))
+                        st["idle"] = 0.0
+                        log.info("adaptive: branch %r recovered -> %d kbps",
+                                 (key[1], key[2]), st["kbps"])
+                        self.video.set_branch_bitrate(key, st["kbps"])
+                else:
+                    st["idle"] = 0.0
+
     def _on_stream_error(self, key: tuple, message: str):
         idx = self.node_to_idx.get(key[0], key[0])
         for client in list(self.clients):
@@ -377,7 +491,7 @@ class DeskLinkServer:
                     for key in list(cap._order):
                         b = cap.branches.get(key, {})
                         branches.append({
-                            "maxh": key[1], "kbps": key[2],
+                            "maxh": key[1], "kbps": b.get("cur_kbps", key[2]),
                             "encoder": b.get("enc_name", ""),
                             "size": list(b.get("dims") or (0, 0)),
                             "clients": self.video._refcounts.get(key, 0),
@@ -453,11 +567,17 @@ class DeskLinkServer:
             proto.video_payload(idx,
                                  proto.FLAG_KEYFRAME if keyframe else 0,
                                  pts_us, data))
+        st = self._adapt.get(key)
+        if st is None:
+            st = {"frames": 0, "drops": 0, "kbps": key[2], "idle": 0.0}
+            self._adapt[key] = st
+        st["frames"] += 1
         for client in self.clients:
             if client.authenticated and client.pkey == key:
                 dropped = client.sender.offer_video(payload)
                 if dropped:
                     self._maybe_force_idr(key)
+                    st["drops"] += 1
 
     def _maybe_force_idr(self, key: tuple):
         now = time.monotonic()
@@ -496,6 +616,7 @@ class DeskLinkServer:
             self.clients.discard(client)
             if client.authenticated and not self.clients:
                 _desktop_notify("DeskLink", "All clients disconnected")
+                self._maybe_lock_session()
             if client.pkey and self.video:
                 self.video.unsubscribe(client.pkey)
                 client.stream = None
@@ -507,6 +628,22 @@ class DeskLinkServer:
             if self.input:
                 self.glib.submit(self.input.release_all)
             await client.sender.close()
+
+    def _maybe_lock_session(self):
+        """Optional privacy: lock the session when the last authenticated
+        client leaves (config `lock_on_disconnect`)."""
+        if not (self.cfg.lock_on_disconnect and not self._stopping.is_set()):
+            return
+        import subprocess
+        try:
+            r = subprocess.run(["loginctl", "lock-session"], timeout=5,
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                log.info("session locked (last client disconnected)")
+            else:
+                log.warning("lock-session failed: %s", (r.stderr or "").strip())
+        except Exception as exc:
+            log.warning("lock-session failed: %s", exc)
 
     async def _handshake(self, reader, writer, client) -> tuple[bool, str]:
         salt = proto.new_salt()
@@ -611,6 +748,16 @@ class DeskLinkServer:
                      client.id, kbps, maxh or "native")
             await client.sender.send_json(
                 {"type": "quality", "kbps": kbps, "maxh": maxh, "ok": True})
+        elif mtype == "set-audio":
+            on = bool(msg.get("on"))
+            fmt = "ogg" if msg.get("format") == "ogg" else "raw"
+            ok = self.audio_mgr is not None
+            client.audio = (on, fmt) if ok else None
+            client.audio_hdr_sent = False
+            if ok and on and fmt == "raw":
+                await self._send_audio_config(client)
+            await client.sender.send_json(
+                {"type": "audio", "on": on, "format": fmt, "ok": ok})
         elif mtype == "unsubscribe":
             if client.pkey and self.video:
                 self.video.unsubscribe(client.pkey)

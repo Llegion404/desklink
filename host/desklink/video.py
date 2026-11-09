@@ -409,6 +409,21 @@ class VideoStreamPipeline:
             except Exception:
                 log.debug("force-key-unit failed", exc_info=True)
 
+    def set_branch_bitrate(self, key: tuple, kbps: int) -> bool:
+        """Live bitrate change (both encoders take kbit/s in 'bitrate').
+        The branch KEY keeps its original kbps as identity; this only moves
+        the encoder's setpoint (adaptive bitrate)."""
+        enc = self.branches.get(key, {}).get("enc")
+        if not enc or not self.pipeline:
+            return False
+        try:
+            enc.set_property("bitrate", max(500, int(kbps)))
+            self.branches[key]["cur_kbps"] = int(kbps)
+            return True
+        except Exception:
+            log.debug("branch bitrate change failed", exc_info=True)
+            return False
+
 
 class VideoManager:
     """One capture per portal node, one encode branch per distinct
@@ -430,6 +445,7 @@ class VideoManager:
         self.on_stream_error = None   # (key, message)
         self.on_encoded_size = None   # (key, w, h) actual encoded size
         self.on_capture_lost = None   # (node_id, msg) capture session gone
+        self.on_branch_reset = None   # (key,) branch rebuilt -> adapt state reset
         self._captures: dict[int, VideoStreamPipeline] = {}
         self._refcounts: dict[tuple, int] = {}
         self._retries: dict[tuple, int] = {}
@@ -488,6 +504,11 @@ class VideoManager:
         cap = self._captures.get(key[0])
         if cap:
             self.glib.submit(cap.force_idr, key)
+
+    def set_branch_bitrate(self, key: tuple, kbps: int):
+        cap = self._captures.get(key[0])
+        if cap:
+            self.glib.submit(cap.set_branch_bitrate, key, kbps)
 
     def stop_all(self):
         self.glib.submit(self._stop_all)
@@ -563,6 +584,11 @@ class VideoManager:
             return
         if claim and cap.branch_encoder(claim) != "nvh264enc":
             self._release_nvenc(node_id)  # fell back at build time
+        # fresh encode: the adaptive controller starts from the configured
+        # bitrate again
+        for k in keys:
+            if self.on_branch_reset:
+                self.on_branch_reset(k)
 
     def _retry(self, node_id: int, key: tuple, failed_enc: str, msg: str):
         """GLib thread: an encode branch errored at runtime — one fallback

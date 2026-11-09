@@ -29,7 +29,8 @@ data class StreamDesc(val id: Int, val w: Int, val h: Int,
 data class FsEntry(val name: String, val isDir: Boolean, val size: Long)
 
 sealed interface Event {
-    data class Hello(val hostName: String, val clipboard: Boolean, val streams: List<StreamDesc>) : Event
+    data class Hello(val hostName: String, val clipboard: Boolean,
+                     val audio: Boolean, val streams: List<StreamDesc>) : Event
     data class Denied(val msg: String) : Event
     data class Subscribed(val stream: Int) : Event
     data class Clipboard(val text: String) : Event
@@ -64,11 +65,15 @@ class Client(
         private const val FT_JSON = 0x01
         private const val FT_VIDEO = 0x02
         private const val FT_FILE = 0x04
+        private const val FT_AUDIO = 0x05
         private const val MAX_FRAME = 16 * 1024 * 1024
     }
 
     /** Set before [connect]; called on the reader thread. */
     var onVideoFrame: ((streamId: Int, keyframe: Boolean, ptsUs: Long, data: ByteArray) -> Unit)? = null
+
+    /** Set before [connect]; called on the reader thread. */
+    var onAudio: ((kind: Int, data: ByteArray) -> Unit)? = null
 
     private val _events = MutableSharedFlow<Event>(
         extraBufferCapacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -145,6 +150,11 @@ class Client(
                                  (payload[3].toInt() and 0xFF)
                         emit(Event.FsChunk(id, payload.copyOfRange(4, len)))
                     }
+                    FT_AUDIO -> {
+                        if (len < 1) continue
+                        onAudio?.invoke(payload[0].toInt() and 0xFF,
+                            payload.copyOfRange(1, len))
+                    }
                     FT_JSON -> handleJson(payload)
                 }
             }
@@ -199,7 +209,8 @@ class Client(
                     val s = arr.getJSONObject(i)
                     streams.add(StreamDesc(s.getInt("id"), s.getInt("w"), s.getInt("h")))
                 }
-                emit(Event.Hello(hello.optString("host"), hello.optBoolean("clipboard"), streams))
+                emit(Event.Hello(hello.optString("host"), hello.optBoolean("clipboard"),
+                    hello.optBoolean("audio"), streams))
             }
             "deny" -> {
                 emit(Event.Denied(hello.optString("msg", "denied")))
@@ -266,6 +277,9 @@ class Client(
         sendJson(JSONObject().put("type", "motion").put("stream", streamId).put("x", x).put("y", y))
     fun sendButton(btn: String, down: Boolean) =
         sendJson(JSONObject().put("type", "button").put("btn", btn).put("down", down))
+    fun sendSetAudio(on: Boolean) = sendJson(
+        JSONObject().put("type", "set-audio").put("on", on).put("format", "raw"))
+
     fun sendScroll(dx: Int, dy: Int) =
         sendJson(JSONObject().put("type", "scroll").put("dx", dx).put("dy", dy))
     fun sendClipboard(text: String) =
@@ -330,7 +344,8 @@ class Client(
                             s.getInt("h")))
                     }
                     emit(Event.Hello(msg.optString("host"),
-                        msg.optBoolean("clipboard"), streams))
+                        msg.optBoolean("clipboard"), msg.optBoolean("audio"),
+                        streams))
                 }
                 "clip" -> emit(Event.Clipboard(msg.optString("text")))
                 "fs-list-reply" -> {

@@ -3,11 +3,16 @@ package com.desklink.client.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.KeyEvent
+import android.view.PixelCopy
 import android.view.SurfaceView
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -91,6 +96,9 @@ import com.desklink.client.video.AvcDecoder
 import kotlinx.coroutines.delay
 import java.io.File
 import java.io.OutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 
 private const val TAG = "dl.Session"
@@ -166,6 +174,11 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
     var surfaceReady by remember { mutableStateOf(false) }
     val surfaceViewRef = remember { mutableStateOf<SurfaceView?>(null) }
 
+    // -- audio (host capability arrives in hello; on = user preference)
+    var audioAvailable by remember { mutableStateOf(false) }
+    var audioOn by remember { mutableStateOf(true) }
+    val audioPlayer = remember { com.desklink.client.media.AudioPlayer() }
+
     // ------------------------------------------------------------- lifecycle
     LaunchedEffect(client) { client.connect() }
 
@@ -173,6 +186,9 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
         client.onVideoFrame = { _, _, pts, data ->
             frameCounter.onFrame(data.size)
             decoder?.feed(data, pts)
+        }
+        client.onAudio = { kind, data ->
+            if (audioOn && audioAvailable) audioPlayer.push(kind, data)
         }
     }
 
@@ -183,6 +199,7 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
                     hostName = event.hostName
                     streams = event.streams
                     clipboardEnabled = event.clipboard
+                    audioAvailable = event.audio
                     connected = true
                     authFailed = false
                     reconnects = 0
@@ -191,6 +208,12 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
                         event.streams.any { it.id == id }
                     } ?: event.streams.firstOrNull()?.id
                     if (target != null) client.subscribe(target)
+                    // audio subscriptions are per-connection: re-apply after
+                    // a host session restart (re-hello), and start the player
+                    if (event.audio && audioOn) {
+                        audioPlayer.start()
+                        client.sendSetAudio(true)
+                    }
                 }
                 is Event.Denied -> {
                     authFailed = true
@@ -361,6 +384,7 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
         onDispose {
             userExit = true
             KeyboardBridge.handler = null
+            audioPlayer.stop()
             client.close("session closed")
             downloadWriters.values.forEach { closeQuietly(it) }
             downloadWriters.clear()
@@ -519,11 +543,56 @@ fun SessionScreen(spec: ConnSpec, onExit: () -> Unit) {
                 }
                 DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
                     DropdownMenuItem(
+                        text = { Text("Screenshot") },
+                        onClick = {
+                            overflowOpen = false
+                            val surface = surfaceViewRef.value
+                            if (surface == null || surface.width == 0) {
+                                Toast.makeText(context, "No video yet", Toast.LENGTH_SHORT).show()
+                            } else {
+                                val bmp = Bitmap.createBitmap(
+                                    surface.width, surface.height, Bitmap.Config.ARGB_8888)
+                                PixelCopy.request(surface, bmp, { result ->
+                                    if (result == PixelCopy.SUCCESS) {
+                                        val name = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+                                            .format(Date())
+                                        val saved = saveBitmap(context, bmp, "$name.png")
+                                        Toast.makeText(
+                                            context,
+                                            if (saved != null) "Saved $name.png" else "Save failed",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        Toast.makeText(context, "Copy failed", Toast.LENGTH_SHORT)
+                                            .show()
+                                    }
+                                }, Handler(Looper.getMainLooper()))
+                            }
+                        },
+                    )
+                    DropdownMenuItem(
                         text = { Text("View only") },
                         leadingIcon = {
                             Checkbox(checked = viewOnly, onCheckedChange = { viewOnly = it })
                         },
                         onClick = { viewOnly = !viewOnly },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Audio") },
+                        leadingIcon = {
+                            Checkbox(checked = audioOn && audioAvailable,
+                                     onCheckedChange = { audioOn = it })
+                        },
+                        onClick = {
+                            audioOn = !audioOn
+                            if (audioOn && audioAvailable) {
+                                audioPlayer.start()
+                                client.sendSetAudio(true)
+                            } else {
+                                audioPlayer.stop()
+                                client.sendSetAudio(false)
+                            }
+                        },
                     )
                     DropdownMenuItem(
                         text = { Text("Immersive") },
@@ -863,6 +932,37 @@ private fun toNormIn(
     val nx = ((p.x - offX) / drawW).coerceIn(0f, 1f)
     val ny = ((p.y - offY) / drawH).coerceIn(0f, 1f)
     return Offset(nx, ny)
+}
+
+// =============================================================== screenshot
+/** Save a captured frame to Pictures/DeskLink (MediaStore on API 29+, app
+ *  dir below); returns null on failure. */
+private fun saveBitmap(context: Context, bmp: Bitmap, name: String): String? {
+    return try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = android.content.ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/DeskLink")
+            }
+            val uri = context.contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: return null
+            context.contentResolver.openOutputStream(uri)?.use {
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+            }
+            name
+        } else {
+            val dir = File(context.getExternalFilesDir(
+                Environment.DIRECTORY_PICTURES), "DeskLink").apply { mkdirs() }
+            val f = File(dir, name)
+            f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            f.absolutePath
+        }
+    } catch (e: Exception) {
+        null
+    }
 }
 
 // ================================================================ keyboard
