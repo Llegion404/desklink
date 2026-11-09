@@ -161,6 +161,7 @@ class DeskLinkServer:
         self._restarting = False
         self._aloop: asyncio.AbstractEventLoop | None = None
         self._display_task: asyncio.Task | None = None
+        self._display_backend = None      # displays.Backend (WM-specific)
         self._control = None                # ControlServer (desklink tui)
         self.audio_mgr: AudioManager | None = None
         self._audio_ogg_hdrs: list[bytes] = []   # captured Ogg header pages
@@ -254,10 +255,14 @@ class DeskLinkServer:
             if client.authenticated:
                 await client.sender.send_json(hello)
 
-        if displays.kscreen_available():
+        self._display_backend = displays.best_backend()
+        if self._display_backend:
+            log.info("display-size tracking via %s", self._display_backend.name)
             if self._display_task:
                 self._display_task.cancel()
             self._display_task = asyncio.ensure_future(self._poll_display_sizes())
+        else:
+            log.info("no display-size backend (portal-reported sizes only)")
 
         if self.cfg.adaptive_bitrate:
             self.video.on_branch_reset = lambda key: \
@@ -405,18 +410,20 @@ class DeskLinkServer:
             self._restarting = False
 
     async def _poll_display_sizes(self):
-        """KWin keeps screencast streams alive across monitor mode changes
-        (it scales into the negotiated buffer), so video survives — but the
-        *logical* desktop size changes and input mapping scales normalized
-        coordinates into it. No D-Bus signal exists for that, so poll
-        kscreen-doctor while someone is subscribed."""
+        """Compositors keep screencast streams alive across monitor mode
+        changes (they scale into the negotiated buffer), so video survives —
+        but the *logical* desktop size changes and input mapping scales
+        normalized coordinates into it. No portal signal exists for that, so
+        poll the compositor's introspection tool (displays backend) while
+        someone is subscribed."""
         await asyncio.sleep(2.0)
         while not self._stopping.is_set():
             if (self.session is not None and self.video is not None
-                    and any(c.stream is not None for c in self.clients)):
+                    and any(c.stream is not None for c in self.clients)
+                    and self._display_backend):
                 try:
                     geoms = await asyncio.to_thread(
-                        displays.query_output_geometries)
+                        self._display_backend.query)
                 except Exception:
                     geoms = {}
                 if geoms and self.session is not None:

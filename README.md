@@ -1,12 +1,13 @@
 # DeskLink
 
-Self-hosted remote desktop for KDE Plasma (Wayland): control your Linux
+Self-hosted remote desktop for Linux Wayland desktops — KDE Plasma, GNOME,
+Hyprland, sway and other wlroots compositors: control your Linux
 desktop from an **Android phone** or another **Linux machine** — over LAN or
 Tailscale, with no cloud, no accounts and no relay servers. One small Python
 host, two clients, one documented wire protocol.
 
 ```
-Android / Linux client                        Linux (KDE Wayland) host
+Android / Linux client                        Linux (Wayland) host
 ┌──────────────────────────┐    TCP 9090   ┌───────────────────────────────┐
 │ MediaCodec / GStreamer   │◄── H.264 ─────│ pipewiresrc → NVENC/x264 →    │
 │ low-latency H.264 decode │── input ─────►│ appsink   (per-client encode) │
@@ -57,17 +58,63 @@ session is created.
 ## Requirements
 
 **Host** (the machine being controlled):
-- KDE Plasma 6 on Wayland with `xdg-desktop-portal-kde`
-- Python 3.10+ with PyGObject (`python-gobject`)
-- GStreamer 1.x: `gst-plugins-good` (pipewiresrc), `gst-plugins-bad`
-  (NVENC, optional), `gst-plugins-ugly` (x264)
-- PipeWire
+- Any **Wayland** compositor with an XDG portal backend that offers
+  ScreenCast + RemoteDesktop (see the table below) — X11 is not supported
+- Python 3.10+ with PyGObject
+- GStreamer 1.x (good + base required; ugly for x264, bad for NVENC)
+- PipeWire (for desktop audio; without it everything else still works)
 
-Arch/CachyOS:
+Run `python3 -m desklink doctor` on the host — it checks every one of
+these and prints what's missing with the package to install.
+
+### Compositors
+
+| Desktop / WM | Capture + input | Live display-size tracking |
+|---|---|---|
+| KDE Plasma | ✅ (`xdg-desktop-portal-kde`) | ✅ `kscreen-doctor` |
+| GNOME | ✅ (`xdg-desktop-portal-gnome`) | ✅ Mutter DisplayConfig |
+| Hyprland | ✅ (`xdg-desktop-portal-hyprland`) | ✅ `hyprctl` |
+| sway / other wlroots | ✅ (`xdg-desktop-portal-wlr`) | ✅ `wlr-randr` |
+| X11 sessions | ❌ | ❌ |
+
+Display-size tracking covers *logical* resolution changes mid-session
+(what input mapping needs); capture-size changes are handled by every
+compositor through the portal itself.
+
+### Install (host)
+
+Arch / CachyOS:
 
 ```bash
 sudo pacman -S --needed python python-gobject gst-plugins-good gst-plugins-bad gst-plugins-ugly pipewire
+# portal backend: xdg-desktop-portal-kde (Plasma), -hyprland (Hyprland), -wlr (sway)
 ```
+
+Debian / Ubuntu:
+
+```bash
+sudo apt install --needed python3-gi gir1.2-gtk-4.0 gir1.2-gst-plugins-base-1.0 \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    gstreamer1.0-pipewire pipewire xdg-desktop-portal-gtk
+# KDE: also xdg-desktop-portal-kde; GNOME: xdg-desktop-portal-gnome
+```
+
+Fedora:
+
+```bash
+sudo dnf install python3-gobject gtk4 \
+    gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
+    pipewire xdg-desktop-portal-gtk
+```
+
+openSUSE:
+
+```bash
+sudo zypper install python3-gobject gstreamer-plugins-good gstreamer-plugins-bad \
+    gstreamer-plugins-ugly pipewire xdg-desktop-portal-gtk
+```
+
+Then `python3 -m desklink doctor` to confirm.
 
 **Android client**: Android 8.0+ (minSdk 26); build with JDK 17 + Android
 SDK 35.
@@ -199,6 +246,9 @@ PIN authentication directly to the internet — Tailscale is recommended.
 - **Consent dialog on every (re)start** — XDG portal policy for
   remote-desktop sessions; it cannot be skipped. Denied/timeout ⇒ the host
   retries or exits
+- **Something is missing / wrong on your distro** — run
+  `python3 -m desklink doctor`; it names every missing package and the
+  portal backend in use
 - **Keyboard/mouse not working** — make sure the consent dialog you approved
   included *remote control*, not just screen sharing
 - **Second stream is x264** — that's the single-NVENC-session guard; the
@@ -216,7 +266,7 @@ host/desklink/     Python host
   audio.py         desktop monitor -> Opus, raw + Ogg framings
   input.py         absolute/relative pointer model, keysym text input
   server.py        asyncio TCP server, auth, fan-out, file transfer
-  displays.py      kscreen-doctor polling for live monitor changes
+  displays.py      live display-size backends (kscreen/hyprctl/wlr-randr/Mutter)
   control.py       local unix socket: status / kick / keyframe
   tui.py           curses dashboard over the control socket
   viewer/          GTK4 desktop viewer (net, decode, app, launcher, hosts)
@@ -230,8 +280,7 @@ host/contrib/      systemd user service + autostart desktop file (optional)
 ## Limitations / roadmap
 
 - One NVENC encode per process (others fall back to x264)
-- KDE-centric host (portal + kscreen-doctor); GNOME/Wayland would need a
-  display-size backend swap
+- Wayland only — no X11 capture path
 - Privacy mode (blacking out the physical monitor) is not possible on
   Plasma Wayland; `lock_on_disconnect` is the closest equivalent
 - Roadmap ideas: session recording, in-session chat, HEVC encode option

@@ -123,6 +123,11 @@ def cmd_tui(args) -> int:
     return run(interval=args.interval, path=path)
 
 
+def cmd_doctor(args) -> int:
+    from .doctor import run
+    return run()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="desklink",
                                      description="DeskLink remote desktop host")
@@ -148,6 +153,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("status", help="show config and connection addresses")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("doctor", help="check this machine for everything "
+                                      "DeskLink needs (any distro/WM)")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("view", help="open the desktop viewer (client)")
     p.add_argument("--host", help="host IP[:port] — omit for the connect GUI "

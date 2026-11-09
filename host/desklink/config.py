@@ -87,12 +87,39 @@ def _serialize(cfg: Config) -> str:
     return "\n".join(out) + "\n"
 
 
+def _parse_flat_toml(text: str) -> dict:
+    """Minimal TOML reader for our flat scalar config — Python 3.10 has no
+    tomllib, and DeskLink's own file is always `key = value` lines written
+    by _serialize() (strings / ints / bools, # comments)."""
+    data: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            data[key] = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        elif value in ("true", "false"):
+            data[key] = value == "true"
+        else:
+            try:
+                data[key] = int(value)
+            except ValueError:
+                data[key] = value
+    return data
+
+
 def load() -> Config:
     cfg = Config()
     if CONFIG_PATH.exists():
-        import tomllib
-        with open(CONFIG_PATH, "rb") as fh:
-            data = tomllib.load(fh)
+        try:
+            import tomllib
+            with open(CONFIG_PATH, "rb") as fh:
+                data = tomllib.load(fh)
+        except ImportError:
+            data = _parse_flat_toml(CONFIG_PATH.read_text(encoding="utf-8"))
         for k, v in data.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
