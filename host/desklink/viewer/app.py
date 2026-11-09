@@ -52,21 +52,30 @@ class AudioPlayback:
     def start(self):
         if self.pipeline:
             return
-        try:
-            self.pipeline = Gst.parse_launch(
-                "appsrc name=src is-live=true do-timestamp=true format=time "
-                "! oggdemux ! opusdec ! audioconvert ! audioresample ! "
-                "pipewiresink")
-            self.src = self.pipeline.get_by_name("src")
-            self.pipeline.set_state(Gst.State.PLAYING)
-        except Exception:
-            log.exception("audio pipeline failed to start")
-            self.pipeline = None
-            self.src = None
+        # pipewiresink on PipeWire desktops; autoaudiosink elsewhere
+        for sink in ("pipewiresink", "autoaudiosink"):
+            if Gst.ElementFactory.find(sink) is None:
+                continue
+            try:
+                self.pipeline = Gst.parse_launch(
+                    "appsrc name=src is-live=true do-timestamp=true "
+                    "format=time ! oggdemux ! opusdec ! audioconvert ! "
+                    f"audioresample ! {sink}")
+                self.src = self.pipeline.get_by_name("src")
+                self.pipeline.set_state(Gst.State.PLAYING)
+                break
+            except Exception:
+                log.exception("audio pipeline failed to start (%s)", sink)
+                self.pipeline = None
+                self.src = None
 
     def push(self, data: bytes):
         if self.src is not None:
             self.src.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+
+    def has_sink(self) -> bool:
+        return any(Gst.ElementFactory.find(s) is not None
+                   for s in ("pipewiresink", "autoaudiosink"))
 
     def stop(self):
         if self.pipeline:
@@ -633,7 +642,10 @@ class ViewerWindow(Gtk.ApplicationWindow):
             self.connected = True
             self.host_name = evt.host
             self.clipboard_ok = evt.clipboard
-            self.audio_ok = evt.audio
+            # the checkbox tracks the preference; sensitivity tracks what's
+            # actually possible (host capability + a local audio sink)
+            self.audio_ok = evt.audio and self.audio_pb.has_sink()
+            self.audio_btn.set_sensitive(self.audio_ok)
             self.streams = evt.streams
             self._rebuild_stream_picker()
             target = (self.current_stream if any(
@@ -675,6 +687,7 @@ class ViewerWindow(Gtk.ApplicationWindow):
         elif kind is EvClosed:
             self.connected = False
             self._scroll_acc_x = self._scroll_acc_y = 0.0
+            self.audio_pb.stop()      # restarts on the next hello (re-apply)
             self.reconnect_btn.set_visible(not evt.will_retry)
             if not evt.will_retry:
                 self._last_error = evt.reason

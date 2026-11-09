@@ -19,7 +19,8 @@ from collections import deque
 from . import config as cfgmod
 from . import displays
 from . import protocol as proto
-from .audio import AudioManager, OPUS_HEAD, available as audio_available
+from .audio import (AudioManager, OPUS_HEAD, default_sink_node as
+                    audio_default_sink_node, available as audio_available)
 from .clipboard import ClipboardBridge
 from .files import FileManager, SandboxViolation
 from .glibloop import GLibRunner
@@ -226,16 +227,26 @@ class DeskLinkServer:
                     self._broadcast_clipboard, text))
 
         # desktop audio is independent of the portal session but rebuilt
-        # with it for one consistent lifecycle
+        # with it for one consistent lifecycle. The sink-node lookup runs a
+        # subprocess (pw-dump) — resolve it HERE, off the GLib thread; only
+        # report audio capability if the pipeline actually started.
         self.audio_mgr = None
         if audio_available():
+            node = await asyncio.to_thread(audio_default_sink_node)
             mgr = AudioManager(self.glib)
             mgr.on_raw = lambda data: aloop.call_soon_threadsafe(
                 self._distribute_audio, proto.AUDIO_OPUS, data)
             mgr.on_ogg = lambda data: aloop.call_soon_threadsafe(
                 self._distribute_audio, proto.AUDIO_OGG, data)
-            self.glib.submit(mgr.start)
-            self.audio_mgr = mgr
+            try:
+                ok = await self.glib.call(lambda: mgr.start(node))
+            except Exception:
+                log.exception("audio manager start failed")
+                ok = False
+            if ok:
+                self.audio_mgr = mgr
+            else:
+                log.info("audio disabled: pipeline did not start")
 
         # clients that survived a session restart re-announce + resubscribe
         hello = self._hello_msg()
@@ -511,6 +522,8 @@ class DeskLinkServer:
                 "id": c.id, "name": c.name,
                 "addr": f"{c.addr[0]}:{c.addr[1]}" if c.addr else "?",
                 "auth": c.authenticated, "stream": cstream,
+                "audio": ({"on": c.audio[0], "format": c.audio[1]}
+                          if c.audio else None),
                 "kbps": c.quality[0], "maxh": c.quality[1],
                 "kbps_out": int(c.sender.bytes_out * 8 / 1000)
                 if c.sender else 0,
@@ -619,6 +632,7 @@ class DeskLinkServer:
                 self._maybe_lock_session()
             if client.pkey and self.video:
                 self.video.unsubscribe(client.pkey)
+                self._adapt.pop(client.pkey, None)
                 client.stream = None
                 client.pkey = None
             for up in client.uploads.values():
@@ -734,6 +748,7 @@ class DeskLinkServer:
             maxh = max(0, int(msg.get("maxh", 0) or 0))
             if (self.video and client.stream is not None
                     and client.pkey is not None):
+                self._adapt.pop(client.pkey, None)   # old branch's stats
                 client.pkey = self.video.move_quality(
                     client.stream, client.pkey, kbps, maxh)
                 # moving onto an already-running encode: push its cached size
@@ -761,6 +776,7 @@ class DeskLinkServer:
         elif mtype == "unsubscribe":
             if client.pkey and self.video:
                 self.video.unsubscribe(client.pkey)
+                self._adapt.pop(client.pkey, None)
             client.stream = None
             client.pkey = None
         elif mtype == "request-idr":

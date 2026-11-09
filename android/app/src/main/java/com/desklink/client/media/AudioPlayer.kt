@@ -58,7 +58,10 @@ class AudioPlayer {
 
     fun stop() {
         running = false
-        synchronized(lock) { lock.notifyAll() }
+        synchronized(lock) {
+            queue.clear()
+            lock.notifyAll()
+        }
         worker?.join(2000)
         worker = null
     }

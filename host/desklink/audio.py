@@ -85,9 +85,15 @@ class AudioManager:
         self.on_ogg = None       # (ogg_page: bytes)    GLib thread
 
     # ------------------------------------------------------------- lifecycle
-    def start(self):
-        """Build + start the capture. GLib thread. Returns True on success."""
-        node = default_sink_node()
+    def start(self, node: int | None = None):
+        """Build + start the capture. GLib thread. Returns True on success.
+        `node` = PipeWire id of the default sink — resolved by the CALLER
+        (asyncio thread) because pw-dump is a subprocess that must not
+        block this loop."""
+        if self.pipeline:
+            return True
+        if node is None:
+            node = default_sink_node()
         if node is None:
             log.warning("audio disabled: could not resolve the default "
                         "sink's monitor node")
