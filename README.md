@@ -255,7 +255,41 @@ PIN authentication directly to the internet — Tailscale is recommended.
   first-connected stream keeps NVENC
 - **Samsung phone kills the app in background** — add DeskLink to
   Settings → Battery → *Never sleeping apps*
-- **No audio** — out of scope for now
+- **No audio** — check the ☰ menu on the client: audio is off until you
+  tick it (and the host must have PipeWire; `desklink doctor` says)
+
+### Login screens (SDDM/GDM) and remote login
+
+DeskLink cannot control the greeter — the login screen you see before any
+user logs in. Capture and input run through the XDG portals **inside your
+logged-in session**; before login there is no session, no portal, and the
+host process isn't running. That's Wayland's security model and it applies
+to every portal-based remote desktop — a pre-login system service like
+AnyDesk's Windows daemon is not possible here.
+
+What to do about "the machine rebooted / I logged out while away":
+
+1. **SDDM auto-login**, so your desktop session exists right after boot:
+   create `/etc/sddm.conf.d/autologin.conf` with
+   `[Autologin]` / `User = <you>` / `Session = plasma`, and add your user
+   to the `autologin` group (`sudo groupadd -r autologin &&
+   sudo gpasswd -a <you> autologin`) — PAM requires it
+2. **Start the host at login** — `host/contrib/` has a systemd user unit
+   and an autostart desktop file
+3. One step still needs a human: **approve the portal consent dialog**
+   once after each reboot — remote-desktop permission cannot persist
+   (portal policy, see above)
+4. **Lock instead of logging out** — `lock_on_disconnect` locks the
+   session when the last client leaves. On reconnect, type your
+   lock-screen password through DeskLink: on Plasma, injected keys reach
+   the lock screen; GNOME's lock screen ignores synthetic input by design
+5. Fallback for everything else (greeter included): **Tailscale SSH**
+   (`tailscale up --ssh`) — `loginctl unlock-session`, restart the host,
+   or reboot, from anywhere
+
+Note: over a plain LAN the DeskLink stream is not encrypted (only the PIN
+handshake is), so prefer Tailscale whenever you'll be typing your system
+password through the session.
 
 ## Project layout
 
@@ -281,6 +315,9 @@ host/contrib/      systemd user service + autostart desktop file (optional)
 
 - One NVENC encode per process (others fall back to x264)
 - Wayland only — no X11 capture path
+- No pre-login control (greeter/SDDM) — portal sessions require a logged-in
+  user; auto-login + lock screen is the workaround (see *Login screens*
+  above)
 - Privacy mode (blacking out the physical monitor) is not possible on
   Plasma Wayland; `lock_on_disconnect` is the closest equivalent
 - Roadmap ideas: session recording, in-session chat, HEVC encode option
